@@ -62,7 +62,7 @@ from reportlab.platypus import (
 
 # ============================= CONFIGURACIÓN =============================
 APP_NAME = "MAKROPETROL NEXUS COMERCIAL"
-APP_VERSION = "5.3.0"
+APP_VERSION = "5.6.0"
 APP_SUBTITLE = "Seguimiento mensual de vendedores, clientes, metas e informes"
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -9315,9 +9315,13 @@ def nx5_context(period, db_path=None):
     photo_count=sum(r.get('photo_roster',False) for r in rows)
     if photo_count:issues.append(nx5_issue(f'Estructura de la foto recibida el 30/10/2026: {photo_count} códigos coinciden. Nombres y asignaciones manuales del período tienen prioridad.','photo_roster_source',severity='info'))
     if len(cuts)>1:issues.append(nx5_issue('Hay asesores con distintas fechas de corte. Revisa la columna Hasta antes de comparar los equipos.','mixed_cutoffs'))
-    return dict(period=period,start_date=min((r['start_date'] for r in rows if r.get('start_date')),default=period+'-01'),end_date=max(cuts,default=''),
+    context=dict(period=period,start_date=min((r['start_date'] for r in rows if r.get('start_date')),default=period+'-01'),end_date=max(cuts,default=''),
         generated_at=nx5_now(),source=dict(filename='; '.join(s.get('filename','') for s in sources) or 'Histórico conservado'),sources=sources,
         advisors=sorted(rows,key=lambda r:str(r['advisor_code'])),issues=issues,brand_goals=line_goals,report_title='Seguimiento del equipo de ventas')
+    context=nx55_apply_roster(context,path)
+    context=nx54_enrich_context(context,path)
+    context['quota_metrics']=[m for m in context.get('quota_metrics',[]) if m.get('metric')!='activation_rate_goal']
+    return context
 
 
 def nx5_filter_context(context, supervisor=None, selected=None, active_only=False):
@@ -9326,6 +9330,7 @@ def nx5_filter_context(context, supervisor=None, selected=None, active_only=Fals
     ids={r['advisor_code'] for r in rows};out['advisors']=rows
     out['issues']=[r for r in context['issues'] if r.get('code') not in {'mixed_cutoffs','photo_roster_source'} and (not r.get('advisor_code') or r['advisor_code'] in ids)]
     out['brand_goals']=[r for r in context['brand_goals'] if r.get('advisor_code') in ids]
+    out['quota_metrics']=[r for r in context.get('quota_metrics',[]) if r.get('advisor_code') in ids]
     cuts=sorted({r.get('end_date') for r in rows if r.get('end_date')})
     out['start_date']=min((r.get('start_date') for r in rows if r.get('start_date')),default=context['period']+'-01')
     out['end_date']=max(cuts,default='')
@@ -9335,15 +9340,20 @@ def nx5_filter_context(context, supervisor=None, selected=None, active_only=Fals
     used={r.get('source_sha') for r in rows if r.get('source_sha')}
     out['sources']=[s for s in context.get('sources',[]) if s.get('sha256') in used]
     names=list(dict.fromkeys(r.get('source_filename') for r in rows if r.get('source_filename')))
+    out['issues']=[i for i in out['issues'] if not i.get('source_file') or i.get('source_file') in names]
     out['source']={'filename':'; '.join(names) or 'Histórico conservado'}
+    delivery=context.get('report_delivery')
+    if delivery and 'nx56_apply_report_context' in globals():
+        out=nx56_apply_report_context(out,delivery['kind'],delivery['cutoff'],
+            delivery.get('final_requested',False),delivery.get('undated_confirmed',False))
     return out
 
 
 def nx5_periods(db_path=None):
     path=str(db_path or DB_PATH);result={nx5_now()[:7]}
     with nx5_connection(path) as con:
-        for table in ['nx5_sources','nx5_goals','advisor_performance']:
-            result.update(r[0] for r in con.execute('SELECT DISTINCT period FROM '+table).fetchall())
+        for table in ['nx5_sources','nx5_goals','advisor_performance','nx55_results_sources']:
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():result.update(r[0] for r in con.execute('SELECT DISTINCT period FROM '+table).fetchall())
     try:result.update(commercial_periods_v4(commercial_sources_v4(path)))
     except (sqlite3.Error,ValueError):pass
     return sorted(result,reverse=True)
@@ -9491,6 +9501,7 @@ def nx52_supervisor_name(value):
 
 
 def nx52_report_identity(row):
+    if str(row.get('advisor_code') or '').startswith('ACT-'):return 'Sin código A2'
     code=str(row.get('advisor_code') or '')
     number=nx52_numeric_alias(row)
     return number+' / A2 '+code if number and number!=code else (number or code)
@@ -10098,11 +10109,19 @@ def nx5_export_excel(context):
         'pending': wb.add_format({'font_color': '#866000', 'bg_color': '#FFF5D5'}),
     }
     sheets = {name: wb.add_worksheet(name) for name in ['Resumen', 'Seguimiento', 'Detalle de gestión', 'Líneas', 'Clientes', 'Metas', 'Compromisos', 'Controles']}
+    quota_hook=globals().get('nx54_metric_rows')
+    selected_codes={str(a.get('advisor_code')) for a in advisors}
+    imported_metrics=[r for r in (quota_hook(context) if quota_hook else [])
+                      if str(r.get('advisor_code')) in selected_codes]
+    if imported_metrics:sheets['Metas importadas']=wb.add_worksheet('Metas importadas')
     source = context.get('source') or {}
     filename = source.get('filename') or context.get('filename') or 'Reporte cargado en NEXUS'
     start, end = context.get('start_date') or source.get('start_date') or '', context.get('end_date') or source.get('end_date') or ''
     period_text = f"{start} al {end}" if start and end else nx5_export_text(context.get('period') or 'Período no informado')
     cut = 'Corte parcial' if nx5_export_partial(context) else 'Período completo informado'
+    reporting=context.get('reporting') or {}
+    delivery=' · '.join(str(reporting.get(k) or '') for k in ['label','cutoff'] if reporting.get(k))
+    if delivery:cut=delivery
 
     def write(ws, row, col, value, fmt='text'):
         style = formats[fmt]
@@ -10128,7 +10147,7 @@ def nx5_export_excel(context):
         ws.set_tab_color(teal)
         ws.set_default_row(19)
         ws.merge_range(0, 0, 1, n - 1, title, formats['title'])
-        ws.merge_range(2, 0, 3, n - 1, f'{period_text} - {cut}. {note}', formats['sub'])
+        ws.merge_range(2, 0, 3, n - 1, f'{period_text} - {cut}. {note} '+str(reporting.get('note') or ''), formats['sub'])
         ws.merge_range(4, 0, 5, n - 1, 'Fuente: ' + nx5_export_text(filename), formats['sub'])
         ws.set_row(7, 36)
         for col, label in enumerate(headers):
@@ -10140,11 +10159,12 @@ def nx5_export_excel(context):
         ws.repeat_rows(7)
         ws.set_paper(9)
         ws.set_margins(0.35, 0.35, 0.45, 0.45)
-        ws.set_footer('&LMakropetrol - NEXUS&R&P / &N', {'margin': 0.2})
+        ws.set_row(2,28);ws.set_row(3,28)
+        ws.set_footer('&L'+(delivery or 'Makropetrol - NEXUS')+'&R&P / &N', {'margin': 0.2})
 
     meta_headers = ['Código', 'Asesor', 'Supervisor', 'Meta ventas USD', 'Meta cobros USD', 'Meta activados programa', 'Meta nuevos programa']
     head(sheets['Metas'], 'Metas del período', 'Celdas azules editables. Deje vacía una meta que no esté definida; cero no genera un porcentaje.', meta_headers, [14, 36, 26, 21, 21, 24, 24])
-    follow_headers = ['Código', 'Asesor', 'Supervisor', 'Cartera informada', 'Activados programa', '% cartera informado', 'Nuevos programa', 'Ventas reportadas USD', 'Meta ventas USD', 'Cumplimiento ventas', 'Faltante ventas USD', 'Cobros USD', 'Meta cobros USD', 'Cumplimiento cobros', 'Meta activados', 'Cumplimiento activados', 'Meta nuevos', 'Cumplimiento nuevos', 'Facturas', 'Notas de crédito', 'Transacciones', 'Página fuente']
+    follow_headers = ['Código', 'Asesor', 'Supervisor', 'Cartera informada', 'Activados programa', '% cartera calculado', 'Nuevos programa', 'Ventas reportadas USD', 'Meta ventas USD', 'Cumplimiento ventas', 'Faltante ventas USD', 'Cobros USD', 'Meta cobros USD', 'Cumplimiento cobros', 'Meta activados', 'Cumplimiento activados', 'Meta nuevos', 'Cumplimiento nuevos', 'Facturas', 'Notas de crédito', 'Transacciones', 'Página fuente']
     head(sheets['Seguimiento'], 'Seguimiento de asesores', 'Las metas se editan en Metas. Activados y nuevos son clasificaciones del programa y pueden solaparse.', follow_headers, [13, 33, 25, 17, 20, 20, 20, 23, 21, 22, 22, 21, 21, 22, 19, 24, 18, 23, 15, 18, 18, 15])
     sales_total = 0.0
     collections_total = 0.0
@@ -10155,32 +10175,35 @@ def nx5_export_excel(context):
         code = nx5_export_text(a.get('advisor_code'))
         advisor_rows[code] = i
         name, supervisor = nx5_export_advisor_name(a), a.get('supervisor') or 'Sin asignar'
-        sales, collections = nx5_export_number(a.get('sales_reported'), 0), nx5_export_number(a.get('collections'), 0)
-        activated, new = nx5_export_number(a.get('activated_reported'), 0), nx5_export_new_count(a)
+        sales, collections = nx5_export_number(a.get('sales_reported')), nx5_export_number(a.get('collections'))
+        activated, new = nx5_export_number(a.get('activated_reported')), nx5_export_new_count(a)
         goals = [nx5_export_goal(a, key) for key in ['sales_goal', 'collections_goal', 'activation_goal', 'new_goal']]
-        sales_total += sales
-        collections_total += collections
-        if goals[0] is not None and goals[0] > 0:
+        sales_total += sales if sales is not None else 0
+        collections_total += collections if collections is not None else 0
+        if goals[0] is not None and goals[0] > 0 and sales is not None:
             assigned_sales += sales
             assigned_goal += goals[0]
         for col, value in enumerate([code, name, supervisor] + goals):
             write(sheets['Metas'], i, col, value, 'input_money' if col in (3, 4) else 'input_integer' if col in (5, 6) else 'text')
         row = [code, name, supervisor, nx5_export_number(a.get('portfolio')), activated,
-               nx5_export_number(a.get('activation_pct_reported'), 0) / 100, new, sales,
+               None, new, sales,
                None, None, None, collections, None, None, None, None, None, None,
                nx5_export_number(a.get('invoices')), nx5_export_number(a.get('credit_notes')),
                nx5_export_number(a.get('transactions')), nx5_export_number(a.get('source_page'))]
         for col, value in enumerate(row):
             style = 'text' if col < 3 else 'percent_source' if col == 5 else 'money' if col in (7, 11) else 'integer'
             write(sheets['Seguimiento'], i, col, value, style)
+        portfolio=nx5_export_number(a.get('portfolio'))
+        activation_ratio=activated/portfolio if activated is not None and portfolio is not None and portfolio>0 else ''
+        sheets['Seguimiento'].write_formula(i,5,f'=IF(AND(ISNUMBER(D{excelrow}),D{excelrow}>0,ISNUMBER(E{excelrow})),E{excelrow}/D{excelrow},"")',formats['percent'],activation_ratio)
         for target_col, source_col, goal in [(8, 'D', goals[0]), (12, 'E', goals[1]), (14, 'F', goals[2]), (16, 'G', goals[3])]:
             formula = f'=IF(Metas!{source_col}{excelrow}="","",Metas!{source_col}{excelrow})'
             sheets['Seguimiento'].write_formula(i, target_col, formula, formats['money' if target_col in (8, 12) else 'integer'], '' if goal is None else goal)
         for target_col, actualcol, goalcol, actual, goal in [(9, 'H', 'I', sales, goals[0]), (13, 'L', 'M', collections, goals[1]), (15, 'E', 'O', activated, goals[2]), (17, 'G', 'Q', new, goals[3])]:
             cached = actual / goal if actual is not None and goal is not None and goal > 0 else ''
-            sheets['Seguimiento'].write_formula(i, target_col, f'=IF(AND({goalcol}{excelrow}>0,{actualcol}{excelrow}<>""),{actualcol}{excelrow}/{goalcol}{excelrow},"")', formats['percent'], cached)
-        cached_gap = max(goals[0] - sales, 0) if goals[0] is not None and goals[0] > 0 else ''
-        sheets['Seguimiento'].write_formula(i, 10, f'=IF(I{excelrow}>0,MAX(I{excelrow}-H{excelrow},0),"")', formats['money'], cached_gap)
+            sheets['Seguimiento'].write_formula(i, target_col, f'=IF(AND(ISNUMBER({goalcol}{excelrow}),{goalcol}{excelrow}>0,ISNUMBER({actualcol}{excelrow})),{actualcol}{excelrow}/{goalcol}{excelrow},"")', formats['percent'], cached)
+        cached_gap = max(goals[0] - sales, 0) if sales is not None and goals[0] is not None and goals[0] > 0 else ''
+        sheets['Seguimiento'].write_formula(i, 10, f'=IF(AND(ISNUMBER(H{excelrow}),ISNUMBER(I{excelrow}),I{excelrow}>0),MAX(I{excelrow}-H{excelrow},0),"")', formats['money'], cached_gap)
     last_follow = max(8, len(advisors) + 7)
     for name, cols in [('Seguimiento', len(follow_headers)), ('Metas', len(meta_headers))]:
         sheets[name].autofilter(7, 0, last_follow, cols - 1)
@@ -10199,7 +10222,7 @@ def nx5_export_excel(context):
         code = nx5_export_text(a.get('advisor_code'))
         for dimension, dimension_label in dimension_labels.items():
             for line in a.get(dimension) or []:
-                amount = nx5_export_number(line.get('amount'), 0)
+                amount = nx5_export_number(line.get('amount'))
                 goal = nx5_export_line_goal(context, code, dimension, line)
                 values = [code, nx5_export_advisor_name(a), a.get('supervisor') or 'Sin asignar', dimension_label,
                           line.get('code'), line.get('name') or ('Sin marca informada' if dimension == 'brands' else str(line.get('code') or 'Sin nombre')),
@@ -10207,8 +10230,8 @@ def nx5_export_excel(context):
                 for col, value in enumerate(values):
                     write(sheets['Líneas'], line_row, col, value, 'number' if col == 6 else 'integer' if col == 7 else 'money' if col == 8 else 'input_money' if col == 9 else 'text')
                 er = line_row + 1
-                sheets['Líneas'].write_formula(line_row, 10, f'=IF(J{er}>0,I{er}/J{er},"")', formats['percent'], amount / goal if goal is not None and goal > 0 else '')
-                sheets['Líneas'].write_formula(line_row, 11, f'=IF(J{er}>0,MAX(J{er}-I{er},0),"")', formats['money'], max(goal - amount, 0) if goal is not None and goal > 0 else '')
+                sheets['Líneas'].write_formula(line_row, 10, f'=IF(AND(ISNUMBER(I{er}),ISNUMBER(J{er}),J{er}>0),I{er}/J{er},"")', formats['percent'], amount / goal if amount is not None and goal is not None and goal > 0 else '')
+                sheets['Líneas'].write_formula(line_row, 11, f'=IF(AND(ISNUMBER(I{er}),ISNUMBER(J{er}),J{er}>0),MAX(J{er}-I{er},0),"")', formats['money'], max(goal - amount, 0) if amount is not None and goal is not None and goal > 0 else '')
                 write(sheets['Líneas'], line_row, 12, a.get('start_date') or start,'date')
                 write(sheets['Líneas'], line_row, 13, a.get('end_date') or end,'date')
                 write(sheets['Líneas'], line_row, 14, a.get('source_filename') or filename)
@@ -10288,6 +10311,32 @@ def nx5_export_excel(context):
     sheets['Compromisos'].autofilter(7,0,max(8,action_row-1),len(action_headers)-1)
     if action_row==8:write(sheets['Compromisos'],8,3,'Sin compromisos registrados en este corte.')
 
+    # Cuotas de los archivos originales, con su unidad y procedencia. El helper
+    # decide qué resultados tienen una definición y unidad comparables.
+    if imported_metrics:
+        imported_headers=['Código asesor','Asesor','Métrica','Unidad','Meta','Resultado comparable','Cumplimiento','Archivo de cuota','Hoja','Celda','Observación']
+        ws=sheets['Metas importadas']
+        head(ws,'Metas importadas y su evidencia','N/D indica que falta un resultado comparable. Las metas de cartera/clientes activos no se convierten en metas de nuevos o recuperados. Litros, dólares y cantidades permanecen separados.',
+             imported_headers,[16,34,43,18,20,23,20,48,30,16,80])
+        for index,item in enumerate(imported_metrics,8):
+            unit=nx5_export_text(item.get('unit'))
+            unit_key=unit.strip().lower()
+            numeric_style='money' if unit_key=='usd' else 'percent' if unit_key in {'proporcion','proporción','ratio','%','porcentaje'} else 'number'
+            target=nx5_export_number(item.get('target'))
+            actual=nx5_export_number(item.get('actual'))
+            ratio=nx5_export_number(item.get('attainment'))
+            values=[item.get('advisor_code'),item.get('advisor_name'),item.get('metric_label'),unit,
+                    target if target is not None else 'N/D',actual if actual is not None else 'N/D',None,
+                    item.get('source_file'),item.get('source_sheet'),item.get('source_cell'),item.get('note')]
+            for col,value in enumerate(values):
+                write(ws,index,col,value,numeric_style if col in (4,5) and isinstance(value,(int,float)) else 'wrap' if col in (2,7,8,10) else 'text')
+            if ratio is not None and actual is not None and target is not None and target>0:
+                er=index+1
+                ws.write_formula(index,6,f'=IF(AND(ISNUMBER(E{er}),E{er}>0,ISNUMBER(F{er})),F{er}/E{er},"")',formats['percent'],actual/target)
+            else:write(ws,index,6,'N/D')
+            ws.set_row(index,34)
+        ws.autofilter(7,0,len(imported_metrics)+7,len(imported_headers)-1)
+
     control_headers = ['Código asesor', 'Asesor', 'Dimensión', 'Venta cabecera USD', 'Total impreso USD', 'Suma detalle USD', 'Impreso menos cabecera USD', 'Detalle menos impreso USD', 'Control', 'Página fuente']
     head(sheets['Controles'], 'Conciliación y observaciones', 'Las diferencias se conservan. Este control no modifica importes de origen. Se señala cualquier diferencia al redondear a centavos.', control_headers, [16, 33, 19, 23, 23, 23, 29, 29, 26, 16])
     control_row, count_diff = 8, 0
@@ -10302,25 +10351,29 @@ def nx5_export_excel(context):
                 continue
             printed = printed or {}
             amount = nx5_export_number(printed.get('amount'))
-            sales = nx5_export_number(a.get('sales_reported'), 0)
-            detail = sum(nx5_export_number(line.get('amount'), 0) for line in lines)
-            difference = amount - sales if amount is not None else None
-            detail_difference = detail - amount if amount is not None else None
+            sales = nx5_export_number(a.get('sales_reported'))
+            detail_values=[nx5_export_number(line.get('amount')) for line in lines]
+            detail=sum(detail_values) if detail_values and all(v is not None for v in detail_values) else None
+            difference = amount - sales if amount is not None and sales is not None else None
+            detail_difference = detail - amount if amount is not None and detail is not None else None
             has_difference = difference is not None and abs(difference) > 0.005 or detail_difference is not None and abs(detail_difference) > 0.005
             if has_difference:
                 count_diff += 1
-            status = 'Revisar diferencia' if has_difference else 'Total impreso ausente' if amount is None else 'Coincide'
+            status = 'Revisar diferencia' if has_difference else 'Datos incompletos' if any(v is None for v in [sales,detail,amount]) else 'Coincide'
             er = control_row + 1
             source_er = advisor_rows[code] + 1
             for col, value in enumerate([code, nx5_export_advisor_name(a), dimension_label, None, amount, None, None, None, None, nx5_export_number(printed.get('source_page') or a.get('source_page'))]):
                 write(sheets['Controles'], control_row, col, value, 'money' if col in (3, 4, 5, 6, 7) else 'integer' if col == 9 else 'text')
-            sheets['Controles'].write_formula(control_row, 3, f'=Seguimiento!H{source_er}', formats['money'], sales)
+            sheets['Controles'].write_formula(control_row, 3, f'=IF(ISNUMBER(Seguimiento!H{source_er}),Seguimiento!H{source_er},"")', formats['money'], '' if sales is None else sales)
             line_end = max(9, line_row)
             formula = f'=SUMIFS(\'Líneas\'!$I$9:$I${line_end},\'Líneas\'!$A$9:$A${line_end},A{er},\'Líneas\'!$D$9:$D${line_end},C{er})'
-            sheets['Controles'].write_formula(control_row, 5, formula, formats['money'], detail)
-            sheets['Controles'].write_formula(control_row, 6, f'=IF(E{er}="","",E{er}-D{er})', formats['money'], '' if difference is None else difference)
-            sheets['Controles'].write_formula(control_row, 7, f'=IF(E{er}="","",F{er}-E{er})', formats['money'], '' if detail_difference is None else detail_difference)
-            status_formula = f'=IF(E{er}="","Total impreso ausente",IF(OR(ROUND(G{er},2)<>0,ROUND(H{er},2)<>0),"Revisar diferencia","Coincide"))'
+            detail_count=f'COUNTIFS(\'Líneas\'!$A$9:$A${line_end},A{er},\'Líneas\'!$D$9:$D${line_end},C{er})'
+            known_count=f'COUNTIFS(\'Líneas\'!$A$9:$A${line_end},A{er},\'Líneas\'!$D$9:$D${line_end},C{er},\'Líneas\'!$I$9:$I${line_end},"<>")'
+            formula=f'=IF(AND({detail_count}>0,{known_count}={detail_count}),'+formula[1:]+',"")'
+            sheets['Controles'].write_formula(control_row, 5, formula, formats['money'], '' if detail is None else detail)
+            sheets['Controles'].write_formula(control_row, 6, f'=IF(AND(ISNUMBER(D{er}),ISNUMBER(E{er})),E{er}-D{er},"")', formats['money'], '' if difference is None else difference)
+            sheets['Controles'].write_formula(control_row, 7, f'=IF(AND(ISNUMBER(E{er}),ISNUMBER(F{er})),F{er}-E{er},"")', formats['money'], '' if detail_difference is None else detail_difference)
+            status_formula = f'=IF(OR(NOT(ISNUMBER(D{er})),NOT(ISNUMBER(E{er})),NOT(ISNUMBER(F{er}))),"Datos incompletos",IF(OR(ROUND(G{er},2)<>0,ROUND(H{er},2)<>0),"Revisar diferencia","Coincide"))'
             sheets['Controles'].write_formula(control_row, 8, status_formula, formats['text'], status)
             control_row += 1
     control_end = max(8, control_row - 1)
@@ -10358,25 +10411,29 @@ def nx5_export_excel(context):
     summary.set_default_row(20)
     summary.merge_range('A1:L2', nx5_export_text(context.get('report_title') or 'Seguimiento comercial'), formats['title'])
     summary.merge_range('A3:L3', f'{period_text} - {cut}', formats['sub'])
+    summary.set_row(2,30)
     total_er = max(9, len(advisors) + 8)
     goal_count = sum(nx5_export_goal(a, 'sales_goal') is not None and nx5_export_goal(a, 'sales_goal') > 0 for a in advisors)
+    known_sales=sum(nx5_export_number(a.get('sales_reported')) is not None for a in advisors)
+    known_collections=sum(nx5_export_number(a.get('collections')) is not None for a in advisors)
+    all_goal=sum(nx5_export_goal(a,'sales_goal') or 0 for a in advisors)
     kpis = [
-        (0, 'Ventas reportadas', f'=SUM(Seguimiento!H9:H{total_er})', sales_total, 'kpi_money'),
-        (3, 'Cobros reportados', f'=SUM(Seguimiento!L9:L{total_er})', collections_total, 'kpi_money'),
-        (6, 'Metas de ventas definidas', f'=IF(COUNTIF(Metas!D9:D{total_er},">0")=0,"Sin metas",SUM(Metas!D9:D{total_er}))', assigned_goal if goal_count else 'Sin metas', 'kpi_money'),
-        (9, 'Cumplimiento con meta', f'=IF(SUM(Metas!D9:D{total_er})>0,SUMIF(Seguimiento!I9:I{total_er},">0",Seguimiento!H9:H{total_er})/SUM(Metas!D9:D{total_er}),"")', assigned_sales / assigned_goal if assigned_goal > 0 else '', 'kpi_percent')]
+        (0, 'Ventas conocidas'+(' (parcial)' if known_sales<len(advisors) else ''), f'=IF(COUNT(Seguimiento!H9:H{total_er})>0,SUM(Seguimiento!H9:H{total_er}),"N/D")', sales_total if known_sales else 'N/D', 'kpi_money'),
+        (3, 'Cobros conocidos'+(' (parcial)' if known_collections<len(advisors) else ''), f'=IF(COUNT(Seguimiento!L9:L{total_er})>0,SUM(Seguimiento!L9:L{total_er}),"N/D")', collections_total if known_collections else 'N/D', 'kpi_money'),
+        (6, 'Metas de ventas definidas', f'=IF(COUNTIF(Metas!D9:D{total_er},">0")=0,"Sin metas",SUM(Metas!D9:D{total_er}))', all_goal if goal_count else 'Sin metas', 'kpi_money'),
+        (9, 'Avance comparable (parcial)', f'=IF(SUMIFS(Seguimiento!I9:I{total_er},Seguimiento!I9:I{total_er},">0",Seguimiento!H9:H{total_er},"<>")>0,SUMIF(Seguimiento!I9:I{total_er},">0",Seguimiento!H9:H{total_er})/SUMIFS(Seguimiento!I9:I{total_er},Seguimiento!I9:I{total_er},">0",Seguimiento!H9:H{total_er},"<>"),"")', assigned_sales / assigned_goal if assigned_goal > 0 else '', 'kpi_percent')]
     for col, label, formula, cached, style in kpis:
         summary.merge_range(4, col, 4, col + 2, label, formats['kpi_label'])
         summary.merge_range(5, col, 6, col + 2, '', formats[style])
         summary.write_formula(5, col, formula, formats[style], cached)
-    summary.merge_range('A9:L9', f'{len(advisors)} registros de vendedor. {goal_count} con meta de ventas. El cumplimiento considera solamente a quienes tienen meta.', formats['sub'])
-    rank = sorted(range(len(advisors)), key=lambda k: nx5_export_number(advisors[k].get('sales_reported'), 0), reverse=True)[:10]
+    summary.merge_range('A9:L9', f'{len(advisors)} registros de vendedor. {goal_count} con meta de ventas. Avance calculado solo sobre asesores con venta y meta disponibles. Los faltantes no son ceros.', formats['sub'])
+    rank = sorted([k for k in range(len(advisors)) if nx5_export_number(advisors[k].get('sales_reported')) is not None], key=lambda k: float(advisors[k]['sales_reported']), reverse=True)[:10]
     for i, k in enumerate(rank, 8):
         a = advisors[k]
         write(summary, i, 13, nx5_export_advisor_name(a))
         follow_er = k + 9
-        summary.write_formula(i, 14, f'=Seguimiento!H{follow_er}', formats['money'], nx5_export_number(a.get('sales_reported'), 0))
-        summary.write_formula(i, 15, f'=IF(Seguimiento!I{follow_er}>0,Seguimiento!J{follow_er},"")', formats['percent'], nx5_export_number(a.get('sales_reported'), 0) / nx5_export_goal(a, 'sales_goal') if nx5_export_goal(a, 'sales_goal') is not None and nx5_export_goal(a, 'sales_goal') > 0 else '')
+        summary.write_formula(i, 14, f'=Seguimiento!H{follow_er}', formats['money'], nx5_export_number(a.get('sales_reported')))
+        summary.write_formula(i, 15, f'=IF(Seguimiento!I{follow_er}>0,Seguimiento!J{follow_er},"")', formats['percent'], nx5_export_number(a.get('sales_reported')) / nx5_export_goal(a, 'sales_goal') if nx5_export_goal(a, 'sales_goal') is not None and nx5_export_goal(a, 'sales_goal') > 0 else '')
     summary.set_column(13, 15, None, None, {'hidden': True})
     if rank:
         for value_col, title, position, color, num_format in [(14, 'Ventas por asesor · Top 10', 'A11', teal, '"$"#,##0'), (15, 'Cumplimiento de ventas · Top 10 en ventas', 'G11', blue, '0%')]:
@@ -10392,12 +10449,12 @@ def nx5_export_excel(context):
             chart.set_size({'width': 490, 'height': 300})
             summary.insert_chart(position, chart)
     # Gráficas adicionales: documentos, cartera y composición de ventas de una sola dimensión.
-    client_rank=sorted(range(len(advisors)),key=lambda k:nx5_export_number(advisors[k].get('portfolio'),0),reverse=True)[:10]
+    client_rank=sorted([k for k in range(len(advisors)) if nx5_export_number(advisors[k].get('portfolio')) is not None and nx5_export_number(advisors[k].get('activated_reported')) is not None],key=lambda k:float(advisors[k]['portfolio']),reverse=True)[:10]
     if client_rank:
         for i,k in enumerate(client_rank,8):
             a=advisors[k];er=k+9
             write(summary,i,16,nx5_export_advisor_name(a))
-            summary.write_formula(i,17,f'=Seguimiento!E{er}',formats['integer'],nx5_export_number(a.get('activated_reported'),0))
+            summary.write_formula(i,17,f'=IF(ISNUMBER(Seguimiento!E{er}),Seguimiento!E{er},"")',formats['integer'],nx5_export_number(a.get('activated_reported')))
             noact=nx5_export_number(a.get('inactive_reported'))
             summary.write_formula(i,18,f'=IF(\'Detalle de gestión\'!H{er}="","",\'Detalle de gestión\'!H{er})',formats['integer'],'' if noact is None else noact)
         chart=wb.add_chart({'type':'bar'})
@@ -10407,10 +10464,11 @@ def nx5_export_excel(context):
         chart.set_y_axis({'reverse':True,'num_font':{'size':9}});chart.set_x_axis({'num_format':'0','major_gridlines':{'visible':True,'line':{'color':'#E2EAF2'}}})
         chart.set_legend({'position':'bottom','font':{'size':8}});chart.set_chartarea({'border':{'none':True},'fill':{'color':'white'}});chart.set_plotarea({'border':{'none':True}});chart.set_size({'width':490,'height':300})
         summary.insert_chart('A27',chart)
-    if advisors:
+    if any(nx5_export_number(a.get(key)) is not None for a in advisors for key in ['invoices','credit_notes']):
         for i,label,col,key in [(8,'Facturas','S','invoices'),(9,'Notas de crédito','T','credit_notes')]:
             write(summary,i,20,label)
-            summary.write_formula(i,21,f'=SUM(Seguimiento!{col}9:{col}{total_er})',formats['integer'],sum(nx5_export_number(a.get(key),0) for a in advisors))
+            known=[nx5_export_number(a.get(key)) for a in advisors if nx5_export_number(a.get(key)) is not None]
+            summary.write_formula(i,21,f'=IF(COUNT(Seguimiento!{col}9:{col}{total_er})>0,SUM(Seguimiento!{col}9:{col}{total_er}),"N/D")',formats['integer'],sum(known) if known else 'N/D')
         chart=wb.add_chart({'type':'doughnut'})
         chart.add_series({'name':'Documentos del período','categories':['Resumen',8,20,9,20],'values':['Resumen',8,21,9,21],
                           'points':[{'fill':{'color':teal}},{'fill':{'color':red}}],
@@ -10451,16 +10509,16 @@ def nx5_export_excel(context):
             if j < 3:
                 val = [a.get('advisor_code'), nx5_export_advisor_name(a), a.get('supervisor') or 'Sin asignar'][j]
             elif j == 3:
-                val = nx5_export_number(a.get('sales_reported'), 0)
+                val = nx5_export_number(a.get('sales_reported'))
             elif j == 4:
                 val = nx5_export_goal(a, 'sales_goal')
             elif j == 5:
                 goal = nx5_export_goal(a, 'sales_goal')
-                val = nx5_export_number(a.get('sales_reported'), 0) / goal if goal is not None and goal > 0 else None
+                val = nx5_export_number(a.get('sales_reported')) / goal if nx5_export_number(a.get('sales_reported')) is not None and goal is not None and goal > 0 else None
             elif j == 6:
-                val = nx5_export_number(a.get('collections'), 0)
+                val = nx5_export_number(a.get('collections'))
             elif j == 7:
-                val = nx5_export_number(a.get('activated_reported'), 0)
+                val = nx5_export_number(a.get('activated_reported'))
             else:
                 val = nx5_export_new_count(a)
             summary.write_formula(i, j, f'=IF(Seguimiento!{ref}="","",Seguimiento!{ref})', formats['percent' if j == 5 else 'money' if j in (3, 4, 6) else 'integer' if j >= 7 else 'text'], '' if val is None else val)
@@ -10469,7 +10527,7 @@ def nx5_export_excel(context):
     summary.fit_to_pages(1, 0)
     summary.set_paper(9)
     summary.print_area(0, 0, max(63, 62 + len(advisors)), 11)
-    summary.set_footer('&LNEXUS Comercial&R&P / &N')
+    summary.set_footer('&L'+(delivery or 'NEXUS Comercial')+'&R&P / &N')
     wb.close()
     return buffer.getvalue()
 
@@ -10614,6 +10672,9 @@ def nx5_export_pdf(context,options=None):
     def issue_message(issue):return issue.get('message') or issue.get('code') or str(issue) if isinstance(issue,dict) else str(issue)
     generated=nx5_export_text(context.get('generated_at') or datetime.now().isoformat(timespec='minutes'))
     cut='CORTE PARCIAL' if nx5_export_partial(context) else 'PERÍODO INFORMADO'
+    reporting=context.get('reporting') or {}
+    delivery=' · '.join(str(reporting.get(k) or '') for k in ['label','cutoff'] if reporting.get(k))
+    if reporting.get('cutoff'):cut='CORTE '+str(reporting['cutoff'])
     mode_label=('INFORME INDIVIDUAL' if complete else 'FICHA INDIVIDUAL') if single else ('INFORME COMPLETO' if complete else 'RESUMEN CON FICHAS')
     def page_header(subject='',a=None):
         def draw(canvas,doc):
@@ -10623,7 +10684,7 @@ def nx5_export_pdf(context,options=None):
             canvas.setFont('Helvetica-Bold',7.5);canvas.drawRightString(W-M,H-27,cut)
             canvas.setFont('Helvetica',7);canvas.drawRightString(W-M,H-43,context.get('period') or '')
             canvas.setFillColor(gray);canvas.setFont('Helvetica',6.8)
-            footer='Generado '+generated[:25]+' · '+mode_label
+            footer=(delivery or mode_label)+' · Generado '+generated[:25]
             canvas.drawString(M,25,fit(footer,U-60,6.8));canvas.drawRightString(W-M,25,str(doc.page))
             if a:
                 canvas.setFont('Helvetica',6.6);canvas.drawString(M,36,fit('Fuente: '+source_for(a)+' · '+range_for(a),U,6.6))
@@ -10664,12 +10725,14 @@ def nx5_export_pdf(context,options=None):
         story=[heading(context.get('report_title') or 'Seguimiento del equipo de ventas','overview',style='NX51Title'),p(range_for(),'NX51Small'),
             cards([('Ventas de cabecera',money(sales)),('Cobros informados',money(collections)),('Vendedores incluidos',str(len(advisors))),('Cumplimiento con meta',nx51_pdf_ratio(covered_sales,goals))]),Spacer(1,10)]
         story.append(p(f'{len(with_goal)} de {len(advisors)} vendedores tienen meta y venta disponibles. La meta es mensual; un corte parcial muestra avance. Los cobros pueden corresponder a facturas de otros meses.','NX51Small'))
-        ranked=sorted(advisors,key=lambda a:nx5_export_number(a.get('sales_reported'),0),reverse=True)
+        known_sales=sum(nx5_export_number(a.get('sales_reported')) is not None for a in advisors)
+        if known_sales<len(advisors):story.append(p(str(known_sales)+' de '+str(len(advisors))+' asesores tienen ventas informadas. Los importes del equipo son sumas de los datos conocidos; faltantes no equivalen a cero.','NX51Small'))
+        ranked=sorted([a for a in advisors if nx5_export_number(a.get('sales_reported')) is not None],key=lambda a:float(a['sales_reported']),reverse=True)
         story.append(nx51_pdf_bar([(nx5_export_advisor_name(a),a.get('sales_reported')) for a in ranked[:10]],'Ventas por asesor · Top 10',U,220,subtitle='La tabla del equipo contiene a todos los vendedores.'))
         summary=[['Lectura inmediata','Resultado de este corte'],
             ['Activados según programa · asignaciones',count(nx51_pdf_total(advisors,'activated_reported'))],
-            ['No activados · filas disponibles',str(sum(len(a.get('clients_inactive') or []) for a in advisors))],
-            ['Nuevos · filas disponibles',str(sum(len(a.get('clients_new') or []) for a in advisors))],
+            ['No activados · filas disponibles','N/D' if context.get('result_mode')=='planillas' else str(sum(len(a.get('clients_inactive') or []) for a in advisors))],
+            ['Nuevos · filas disponibles','N/D' if context.get('result_mode')=='planillas' else str(sum(len(a.get('clients_new') or []) for a in advisors))],
             ['Vendedores con diferencias de importes',str(len(affected))],
             ['Diferencia neta cabecera − un desglose por vendedor',money(sum(v for _,v in affected))]]
         story += [Spacer(1,8),table(summary,[U*.65,U*.35]),Spacer(1,8),p('Activados, no activados y nuevos son categorías del programa. Nuevos puede solaparse con las otras listas: no se suman para obtener clientes únicos. Los números de lista no son códigos de cliente.','NX51Small'),p('Fuente: '+source,'NX51Small')]
@@ -10723,8 +10786,8 @@ def nx5_export_pdf(context,options=None):
         portfolio=nx5_export_number(a.get('portfolio'));activated=nx5_export_number(a.get('activated_reported'))
         derived_activation=activated/portfolio*100 if portfolio is not None and portfolio>0 and activated is not None and 0<=activated<=portfolio else None
         facts=[['Cartera informada',count(a.get('portfolio')),'Activación impresa',pct(activation)],
-               ['Activación calculada',pct(derived_activation) if derived_activation is not None else 'No calculable','Filas activados leídas',str(len(a.get('clients_activated') or []))],
-               ['No activados impresos',count(noact),'Filas no activados leídas',str(len(a.get('clients_inactive') or []))],
+               ['Activación calculada',pct(derived_activation) if derived_activation is not None else 'No calculable','Filas activados leídas',('N/D' if context.get('result_mode')=='planillas' else str(len(a.get('clients_activated') or [])))],
+               ['No activados impresos',count(noact),'Filas no activados leídas',('N/D' if context.get('result_mode')=='planillas' else str(len(a.get('clients_inactive') or [])))],
                ['Participación en ventas',pct(a.get('sales_share_reported')),'Unidades netas · un desglose',count(totaldim.get('units') if totaldim else None)],
                ['Facturas / notas de crédito',count(a.get('invoices'))+' / '+count(a.get('credit_notes')),'Transacciones',count(a.get('transactions'))]]
         story += [table(facts,[U*.29,U*.21,U*.31,U*.19],header=False),Spacer(1,10)]
@@ -10745,36 +10808,65 @@ def nx5_export_pdf(context,options=None):
             if diff:story.append(p('Diferencia de origen: cabecera '+money(a.get('sales_reported'))+'; desglose '+money(printed.get('amount'))+'; cabecera − desglose '+money(diff)+'.','NX51Alert'))
         sales_goal=nx5_export_number(a.get('sales_goal'));actual=nx5_export_number(a.get('sales_reported'))
         if sales_goal and actual is not None:story.append(p('Brecha de venta para alcanzar la meta: '+money(max(0,sales_goal-actual))+'.','NX51Small'))
+        quota_hook=globals().get('nx54_metric_rows')
+        imported_metrics=[r for r in (quota_hook(context,code) if quota_hook else []) if str(r.get('advisor_code'))==code]
+        if imported_metrics:
+            story += [heading('Metas importadas y unidades',key+'_imported_goals',1,style='NX51H2'),
+                      p('N/D significa que no hay un resultado comparable. Las cuotas de cartera/clientes activos se conservan separadas de nuevos o recuperados. No se convierten litros en dólares ni cantidades en ventas.','NX51Small')]
+            imported_data=[['Métrica','Unidad','Meta','Resultado','Avance']]
+            provenance=[]
+            for item in imported_metrics:
+                unit=str(item.get('unit') or 'No informada')
+                def metric_value(value):
+                    number=nx5_export_number(value)
+                    if number is None:return 'N/D'
+                    if unit.strip().lower()=='usd':return money(number)
+                    if unit.strip().lower() in {'proporcion','proporción','ratio','%','porcentaje'}:return f'{number*100:.1f}%'
+                    return f'{number:,.0f}' if number.is_integer() else f'{number:,.2f}'
+                target=nx5_export_number(item.get('target'));value=nx5_export_number(item.get('actual'))
+                comparable=nx5_export_number(item.get('attainment')) is not None and value is not None and target is not None and target>0
+                imported_data.append([item.get('metric_label') or 'Meta sin etiqueta',unit,metric_value(target),metric_value(value),nx51_pdf_ratio(value,target) if comparable else 'N/D'])
+                evidence=' · '.join(str(item.get(k)) for k in ['source_file','source_sheet','source_cell'] if item.get(k))
+                note=str(item.get('note') or '')
+                description=(str(item.get('metric_label') or 'Meta')+': '+evidence+(' · '+note if note else '')).strip()
+                if description and description not in provenance:provenance.append(description)
+            story.append(table(imported_data,[U*.38,U*.12,U*.17,U*.17,U*.16],small=True))
+            for evidence in provenance:story.append(p(evidence,'NX51Small'))
+        story.append(p('Criterios de seguimiento: activación de cartera de 70 % o más; activación de todas las líneas asignadas (100 %). Activar una línea y alcanzar su cuota en USD son medidas distintas.','NX51Small'))
         action=a.get('actions') or {}
         if any(action.values()):story += [heading('Compromiso de seguimiento',style='NX51H2'),p(action.get('text') or 'Sin descripción'),p('Responsable: '+str(action.get('owner') or 'No informado')+' · Fecha: '+str(action.get('due') or 'No informada')+' · Estado: '+str(action.get('status') or 'No informado'),'NX51Small')]
         story.append(p('Fuente: '+source_for(a)+' · Página inicial '+str(a.get('source_page') or 'N/D')+'. Las listas y los desgloses completos siguen en los anexos de este asesor.' if complete else 'Fuente: '+source_for(a)+' · Página inicial '+str(a.get('source_page') or 'N/D')+'.','NX51Small'))
         if not complete:continue
-        # Detalle de clientes: conserva cada fila de cada lista y su localización.
-        story += [Spacer(1,7),heading('Clientes de '+nx5_export_advisor_name(a),key+'_clients',1,style='NX51H2'),p('Clasificaciones del programa. El número de lista identifica la posición impresa, no al cliente en A2. Un mismo nombre puede aparecer en varias listas; se conserva en cada una.','NX51Small')]
-        for field,label in [('clients_activated','Clientes activados'),('clients_inactive','Clientes no activados'),('clients_new','Clientes nuevos')]:
-            clients=list(a.get(field) or []);expected=a.get('section_counts',{}).get(field)
-            if expected is None:
-                expected=a.get('activated_reported') if field=='clients_activated' else a.get('inactive_reported') if field=='clients_inactive' else nx5_export_new_count(a)
-            text=label+' · '+str(len(clients))+' filas leídas'
-            story.append(heading(text,key+'_'+field,1,style='NX51H2'))
-            story.append(p('Contador impreso: '+count(expected)+'.'+(' El contador y las filas no coinciden; se conservan todas.' if expected is not None and float(expected)!=len(clients) else ''),'NX51Small'))
-            if not clients:
-                story.append(p('No hay listado en la fuente para este apartado.' if expected is None else 'La fuente no contiene filas en este apartado.','NX51Small'));continue
-            client_cells=[]
-            for item in clients:
-                name=item.get('name') or item.get('raw') or 'Nombre no informado'
-                html='<b>'+escape(nx5_export_text(name))+'</b>'
-                if contacts:
-                    contact_parts=[]
-                    if item.get('phone'):contact_parts.append('Tel. '+escape(nx5_export_text(item['phone'])))
-                    if item.get('address'):contact_parts.append(escape(nx5_export_text(item['address'])))
-                    if contact_parts:html+=' <font color="#617889">· '+' · '.join(contact_parts)+'</font>'
-                html+='<br/><font size="6.7" color="#617889">Lista '+escape(str(item.get('source_number') or 'N/D'))+' · Página '+escape(str(item.get('source_page') or 'N/D'))+'</font>'
-                client_cells.append(p(html,'NX51Client',True))
-            pairs=[]
-            for i in range(0,len(client_cells),2):pairs.append(client_cells[i:i+2]+([''] if i+1==len(client_cells) else []))
-            t=Table(pairs,colWidths=[U/2,U/2],hAlign='LEFT')
-            t.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),10),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),4),('ROWBACKGROUNDS',(0,0),(-1,-1),[pale,C.white]),('LINEBELOW',(0,0),(-1,-1),.3,line)]));story.append(t)
+        if context.get('result_mode')!='planillas':
+            # Detalle de clientes: conserva cada fila de cada lista y su localización.
+            story += [Spacer(1,7),heading('Clientes de '+nx5_export_advisor_name(a),key+'_clients',1,style='NX51H2'),p('Clasificaciones del programa. El número de lista identifica la posición impresa, no al cliente en A2. Un mismo nombre puede aparecer en varias listas; se conserva en cada una.','NX51Small')]
+            for field,label in [('clients_activated','Clientes activados'),('clients_inactive','Clientes no activados'),('clients_new','Clientes nuevos')]:
+                clients=list(a.get(field) or []);expected=a.get('section_counts',{}).get(field)
+                if expected is None:
+                    expected=a.get('activated_reported') if field=='clients_activated' else a.get('inactive_reported') if field=='clients_inactive' else nx5_export_new_count(a)
+                text=label+' · '+str(len(clients))+' filas leídas'
+                story.append(heading(text,key+'_'+field,1,style='NX51H2'))
+                story.append(p('Contador impreso: '+count(expected)+'.'+(' El contador y las filas no coinciden; se conservan todas.' if expected is not None and float(expected)!=len(clients) else ''),'NX51Small'))
+                if not clients:
+                    story.append(p('No hay listado en la fuente para este apartado.' if expected is None else 'La fuente no contiene filas en este apartado.','NX51Small'));continue
+                client_cells=[]
+                for item in clients:
+                    name=item.get('name') or item.get('raw') or 'Nombre no informado'
+                    html='<b>'+escape(nx5_export_text(name))+'</b>'
+                    if contacts:
+                        contact_parts=[]
+                        if item.get('phone'):contact_parts.append('Tel. '+escape(nx5_export_text(item['phone'])))
+                        if item.get('address'):contact_parts.append(escape(nx5_export_text(item['address'])))
+                        if contact_parts:html+=' <font color="#617889">· '+' · '.join(contact_parts)+'</font>'
+                    html+='<br/><font size="6.7" color="#617889">Lista '+escape(str(item.get('source_number') or 'N/D'))+' · Página '+escape(str(item.get('source_page') or 'N/D'))+'</font>'
+                    client_cells.append(p(html,'NX51Client',True))
+                pairs=[]
+                for i in range(0,len(client_cells),2):pairs.append(client_cells[i:i+2]+([''] if i+1==len(client_cells) else []))
+                t=Table(pairs,colWidths=[U/2,U/2],hAlign='LEFT')
+                t.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),10),('TOPPADDING',(0,0),(-1,-1),2),('BOTTOMPADDING',(0,0),(-1,-1),4),('ROWBACKGROUNDS',(0,0),(-1,-1),[pale,C.white]),('LINEBELOW',(0,0),(-1,-1),.3,line)]));story.append(t)
+        else:
+            story.append(heading('Disponibilidad del listado nominal',key+'_clients',1,style='NX51H2'))
+            story.append(p('La planilla de resultados aporta conteos de clientes; no contiene un listado nominal. El PDF original puede consultarse seleccionando su fuente.','NX51Small'))
         # Todas las líneas, no solo las marcas de las gráficas.
         story += [Spacer(1,7),heading('Ventas por línea de '+nx5_export_advisor_name(a),key+'_lines',1,style='NX51H2'),p('Marca, departamento y categoría son tres vistas de las mismas ventas. No se suman entre sí. Unidades y montos negativos se mantienen para reflejar devoluciones o notas de crédito.','NX51Small')]
         for dimension,label in [('departments','Departamento'),('brands','Marca'),('categories','Categoría')]:
@@ -10815,6 +10907,8 @@ def nx5_export_pdf(context,options=None):
     story += [heading('Qué acredita este informe',style='NX51H2'),p('Incluye ventas y cobros por asesor, cartera, activación informada, clientes nuevos informados, documentos y los desgloses disponibles. Las metas y asignaciones se incorporan cuando están cargadas para el mismo período.','NX51Body'),
         p('Este reporte no contiene importes ni productos vendidos por cada cliente, números/fechas de sus facturas, fechas de primera o última compra, visitas, prospección ni política de comisiones. Por ello no se deducen esos datos ni se verifica recuperación tras 30 días o compra superior a USD 100 por cliente.','NX51Body'),
         p('Para completar esos análisis se requiere el detalle de documentos con código de cliente, asesor, fecha, importe y línea/producto, y el historial de compras correspondiente. Los próximos cortes actualizan el mes; no se suman de nuevo.','NX51Small')]
+    if reporting:
+        story.insert(0,p(delivery+'. '+str(reporting.get('note') or ''),'NX51Small'))
     doc.build(story)
     return output.getvalue()
 
@@ -10856,7 +10950,7 @@ def nx52_build_report_bundle(context, options=None, include_pdf=True, include_ex
             code=str(advisor['advisor_code'])
             single=nx5_filter_context(context,selected=[advisor['advisor_code']])
             if len(single.get('advisors',[]))!=1:raise ValueError('No se pudo aislar el asesor '+code+'.')
-            stem=nx52_report_stem(advisor,context.get('period',''))
+            stem=nx52_report_stem(advisor,context.get('period',''))+nx56_delivery_file_piece(context)
             try:
                 if include_pdf:
                     name='PDF/'+stem+'.pdf'
@@ -10878,6 +10972,14 @@ def nx52_build_report_bundle(context, options=None, include_pdf=True, include_ex
 def nx52_report_coverage_ui(context):
     with st.expander('Qué información entrará en esta entrega',expanded=True):
         rows=context['advisors']
+        if context.get('result_mode')=='planillas':
+            known=nx55_report_rows(context)
+            cols=st.columns(3)
+            cols[0].metric('Asesores seleccionados',len(rows))
+            cols[1].metric('Con volumen informado',str(sum(r['volume_actual'] is not None for r in known))+' / '+str(len(rows)))
+            cols[2].metric('Con activación informada',str(sum(r['activated'] is not None for r in known))+' / '+str(len(rows)))
+            st.caption('Las planillas aportan resultados y metas declarados. Los nombres de cada cliente necesitan un reporte detallado; no se completan con otro corte.')
+            return
         values=[('Vendedores seleccionados',len(rows)),('Con meta de venta',sum(bool(r.get('sales_goal')) for r in rows)),
             ('Clientes activados · filas',sum(len(r.get('clients_activated',[])) for r in rows)),
             ('No activados · filas',sum(len(r.get('clients_inactive',[])) for r in rows)),
@@ -10895,7 +10997,9 @@ def nx52_report_coverage_ui(context):
 
 
 def nx5_reports(context):
-    nx5_hero('Tu equipo o un asesor. Tú eliges.','Descarga el informe general o entrega a cada asesor su propio seguimiento.','INFORMES')
+    nx5_hero('Seguimiento semanal y cierre mensual.','Descarga resultados del equipo o de cada asesor, con su fecha de corte.','INFORMES')
+    context,delivery_ready=nx56_delivery_ui(context)
+    if not delivery_ready:return
     rows=context['advisors']
     if not rows:st.info('Carga primero un seguimiento para generar el informe.');return
     nx5_status(context)
@@ -10913,10 +11017,12 @@ def nx5_reports(context):
         if not selected:st.info('Selecciona al menos un asesor.');return
         ctx=nx5_filter_context(context,selected=selected)
         st.caption(f'{len(ctx["advisors"])} de {len(rows)} asesores incluidos en el filtro actual. Para el informe de toda la empresa, elige «Todos los equipos» en el menú lateral.')
-        mode=st.radio('Contenido del PDF',['Completo: clientes, líneas y controles','Resumen con fichas de asesores'],horizontal=True,key='nx51_pdf_detail')
+        mode=st.radio('Nivel del informe',['Resumido · para el dueño','Mediano · por supervisor','Completo · con respaldo'],horizontal=True,key='nx55_report_detail')
         contacts=st.checkbox('Añadir teléfonos y direcciones al PDF (aumenta las páginas)',value=False,disabled=not mode.startswith('Completo'),key='nx51_pdf_contacts')
-        options={'detail':'complete' if mode.startswith('Completo') else 'executive','include_contacts':contacts}
-        st.caption('El completo incluye todos los clientes listados, todas las líneas, gráficas y controles. El informe individual empieza directamente por la ficha del asesor. Teléfonos y direcciones se conservan también en Excel.')
+        level='complete' if mode.startswith('Completo') else 'mediano' if mode.startswith('Mediano') else 'resumido'
+        ctx['report_level']=level
+        options={'detail':level,'include_contacts':contacts}
+        st.caption('Resumido: resultados del equipo y observaciones para dirección. Mediano: seguimiento por supervisor. Completo: indicadores y respaldo disponible de la fuente elegida. Las listas de clientes solo están disponibles en la vista del PDF original.')
         include_pdf=True;include_excel=True
         if scope=='Un archivo por asesor':
             a,b=st.columns(2)
@@ -10926,7 +11032,7 @@ def nx5_reports(context):
         nx52_report_coverage_ui(ctx)
         nx5_table(ctx)
         payload={'context':{k:v for k,v in ctx.items() if k!='generated_at'},'options':options,'scope':scope,
-            'include_pdf':include_pdf,'include_excel':include_excel,'report_version':'5.2'}
+            'include_pdf':include_pdf,'include_excel':include_excel,'report_version':APP_VERSION}
         signature=hashlib.sha256(nx5_json(payload).encode()).hexdigest()
         if scope=='Un archivo por asesor':
             if st.button('Preparar reportes separados',type='primary',disabled=not (include_pdf or include_excel)):
@@ -10934,6 +11040,7 @@ def nx5_reports(context):
                 try:
                     def update(index,total,label):progress.progress(index/total,text=f'{index} de {total} · '+label)
                     result=nx52_build_report_bundle(ctx,options,include_pdf,include_excel,update)
+                    nx56_ensure_saved(ctx)
                     st.session_state['nx52_bundle_ready']={'signature':signature,**result}
                 except Exception as exc:
                     st.session_state.pop('nx52_bundle_ready',None)
@@ -10941,7 +11048,7 @@ def nx5_reports(context):
                 finally:progress.empty()
             ready=st.session_state.get('nx52_bundle_ready',{})
             if ready.get('signature')==signature:
-                stem='NEXUS_reportes_por_asesor_'+nx52_file_piece(period,12)
+                stem='NEXUS_reportes_por_asesor_'+nx52_file_piece(period,12)+'_'+str(ctx.get('report_level') or 'complete')+'_'+str(ctx.get('result_mode') or 'pdf')+nx56_delivery_file_piece(ctx)
                 st.download_button('Descargar reportes separados (ZIP)',ready['data'],stem+'.zip','application/zip',width='stretch')
                 st.success(f'{ready["advisors_count"]} asesores · {len(ready["files"])} documentos independientes preparados.')
             elif not include_pdf and not include_excel:st.warning('Selecciona al menos un formato para preparar los reportes separados.')
@@ -10950,6 +11057,7 @@ def nx5_reports(context):
                 try:
                     with st.spinner('Preparando el informe y la planilla…'):
                         pdf=nx5_export_pdf(ctx,options);xlsx=nx5_export_excel(ctx)
+                    nx56_ensure_saved(ctx)
                     st.session_state['nx52_export_ready']={'signature':signature,'pdf':pdf,'xlsx':xlsx}
                 except Exception as exc:
                     st.session_state.pop('nx52_export_ready',None)
@@ -10958,6 +11066,7 @@ def nx5_reports(context):
             if ready.get('signature')==signature:
                 single=scope=='Informe de un asesor'
                 stem=nx52_report_stem(ctx['advisors'][0],period) if single else 'NEXUS_vendedores_'+nx52_file_piece(period,12)
+                stem+='_'+str(ctx.get('report_level') or 'complete')+'_'+str(ctx.get('result_mode') or 'pdf')+nx56_delivery_file_piece(ctx)
                 a,b=st.columns(2)
                 a.download_button('Descargar PDF del asesor' if single else 'Descargar informe PDF',ready['pdf'],stem+'.pdf','application/pdf',width='stretch')
                 b.download_button('Descargar Excel del asesor' if single else 'Descargar planilla Excel',ready['xlsx'],stem+'.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',width='stretch')
@@ -11048,12 +11157,13 @@ def nx53_initialize(db_path=None):
 
 
 def nx53_initial_period(db_path=None):
-    path=str(db_path or DB_PATH)
+    path=str(db_path or DB_PATH);stored=[]
     with nx5_connection(path) as con:
-        row=con.execute('SELECT MAX(period) FROM nx5_sources').fetchone()
-        if row and row[0]:return row[0]
-    periods=nx5_periods(path)
-    return periods[0]
+        for table in ['nx5_sources','nx55_results_sources','nx5_goals']:
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
+                row=con.execute('SELECT MAX(period) FROM '+table).fetchone()
+                if row and row[0]:stored.append(row[0])
+    return max(stored) if stored else nx5_periods(path)[0]
 
 
 def nx53_replace_constant(source,name,value):
@@ -11111,6 +11221,2117 @@ def nx53_portable_ui():
         st.caption('Copia preparada: '+ready['metadata']['created_at']+'. Incluye información de la empresa: comparte el archivo solo con las personas autorizadas.')
 
 
+# NEXUS 5.4 · Lector de cuotas, sin escrituras en la fuente ni en la base.
+def nx54_parse_goal_file(raw,filename,period):
+    """Lee matrices o tablas de metas; mantiene logros y alternativas separados."""
+    import csv,datetime,hashlib,io,json,math,re,unicodedata
+    if not isinstance(raw,(bytes,bytearray)):raise ValueError('El archivo debe recibirse como bytes.')
+    if len(raw)>30_000_000:raise ValueError('El archivo supera 30 MB. Divídelo por equipo o mes.')
+    if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',str(period)):raise ValueError('Selecciona un período AAAA-MM válido.')
+    sha=hashlib.sha256(raw).hexdigest()
+    out={'metadata':{'filename':str(filename),'sha256':sha,'period':period,'parser_version':'5.4.0','kind':'goals'},'candidates':[],'actuals':[],'issues':[],'sheets':[]}
+    months={'ENERO':1,'FEBRERO':2,'MARZO':3,'ABRIL':4,'MAYO':5,'JUNIO':6,'JULIO':7,'AGOSTO':8,'SEPTIEMBRE':9,'SETIEMBRE':9,'OCTUBRE':10,'NOVIEMBRE':11,'DICIEMBRE':12}
+    units={'sales_goal':'USD','new_goal':'clientes','active_clients_goal':'clientes','line_count_goal':'lineas','activation_rate_goal':'proporcion','line_sales_goal':'USD','activation_goal':'clientes','collections_goal':'USD','visits_goal':'visitas'}
+    def text(v):return re.sub(r'\s+',' ',str(v if v is not None else '')).strip()
+    def norm(v):return ''.join(c for c in unicodedata.normalize('NFKD',text(v).upper()) if not unicodedata.combining(c))
+    def key(v):return re.sub(r'[^A-Z0-9]','',norm(v))
+    def number(v):
+        if isinstance(v,bool) or v is None:return None
+        if isinstance(v,(int,float)):return float(v) if math.isfinite(v) else None
+        s=text(v)
+        if not s or key(s) in {'NA','NAD','ND','NOAPLICA','NODISPONIBLE'} or s.startswith(('=','#')):return None
+        s=re.sub(r'(?i)USD|US\$|\$|%','',s).replace(' ','')
+        if ',' in s and '.' in s:s=s.replace('.','').replace(',','.') if s.rfind(',')>s.rfind('.') else s.replace(',','')
+        elif ',' in s:s=s.replace(',','.')
+        try:v=float(s);return v if math.isfinite(v) else None
+        except (ValueError,TypeError):return None
+    def colstr(c):
+        r=''
+        while c:c,n=divmod(c-1,26);r=chr(65+n)+r
+        return r
+    def cell(r,c):return colstr(c)+str(r)
+    def issue(code,message,sheet='',cells=None,severity='warning',details=None):
+        out['issues'].append({'code':code,'message':message,'source_file':str(filename),'source_sheet':sheet,'source_cells':cells or [],'severity':severity,'details':details})
+    def add(metric,value,ref,name,sup,sheet,coordinate,label,origin='detail',line_name=None,actual=False,**extra):
+        val=number(value)
+        if val is None:return None
+        if val<0 and not actual:
+            issue('negative_goal','La meta es negativa; se conserva para revisión y no se propone.',sheet,[coordinate],details={'metric':metric,'value':val});return None
+        if not actual and units.get(metric) in {'clientes','lineas','visitas'} and not val.is_integer():
+            issue('invalid_count_goal','La meta de clientes, líneas o visitas debe ser un número entero.',sheet,[coordinate],details={'metric':metric,'value':val});return None
+        if metric=='activation_rate_goal':
+            if val>1 and val<=100:val/=100
+            if val>1:
+                issue('invalid_rate_goal','La proporción de activación supera 100 %. Revisa la celda.',sheet,[coordinate]);return None
+        item={'id':hashlib.sha256((sha+'|'+sheet+'|'+coordinate+'|'+metric+'|'+('actual' if actual else 'goal')).encode()).hexdigest()[:24],
+            'metric':metric,'value':val,'unit':units.get(metric,'USD'),'advisor_ref':text(ref),'advisor_name':text(name),'supervisor':text(sup) or None,
+            'source_file':str(filename),'source_sha':sha,'source_sheet':sheet,'source_cell':coordinate,'source_label':text(label),
+            'origin':origin,'priority':100 if origin in {'summary','table'} else 80,'period':period,**extra}
+        if line_name:item['line_name']=text(line_name)
+        (out['actuals'] if actual else out['candidates']).append(item)
+        return item
+    def summary_context(grid):
+        for r,row in enumerate(grid[:30],1):
+            keys=[key(v) for v in row]
+            if 'CARTERA' not in keys:continue
+            p=keys.index('CARTERA')+1
+            if len(keys)<p+9:continue
+            if not ('META' in keys[p+2] or 'CLIENTE' in keys[p+2]):continue
+            if not ('CUOTA' in keys[p+5] or 'MONTO' in keys[p+5]):continue
+            if not ('CUOTA' in keys[p+8] or 'MARCA' in keys[p+8]):continue
+            above=[key(v) for v in grid[r-2]] if r>1 else []
+            codecol=next((i+1 for i,k in enumerate(keys) if k in {'COD','CODASESOR','CODIGO','CODIGOASESOR'}),None)
+            codecol=codecol or next((i+1 for i,k in enumerate(above) if k in {'COD','CODASESOR','CODIGO','CODIGOASESOR'}),None)
+            return {'row':r,'portfolio':p,'name':p-1,'code':codecol,'new':p+3,'sales':p+6,'lines':p+9}
+        return None
+    def supervisor(grid,detail=False):
+        for row in grid[:13]:
+            for i,v in enumerate(row[:12]):
+                k=key(v)
+                if k in {'SUPERVISOR','GERENTE','GERENTEREGIONAL'} and i+1<len(row) and text(row[i+1]):return text(row[i+1])
+        return ''
+    def period_ok(grid,sheet):
+        m=set();years=set()
+        for row in grid[:8]:
+            for ci,v in enumerate(row[:30]):
+                if isinstance(v,(datetime.date,datetime.datetime)):m.add(v.month);years.add(v.year);continue
+                n=norm(v)
+                left=key(row[ci-1]) if ci else ''
+                date_context=left in {'MES','PERIODO','FECHA','FECHADECORTE','ANO','ANIO'}
+                month_text=bool(re.fullmatch(r'(?:'+('|'.join(months))+r')(?:\s+20\d{2})?',n)) and left not in {'ASESOR','NOMBRE','NOMBREASESOR'}
+                for token,mn in months.items():
+                    if (date_context or month_text) and re.search(r'(?<![A-Z])'+token+r'(?![A-Z])',n):m.add(mn)
+                if date_context or month_text:years.update(int(y) for y in re.findall(r'\b(20\d{2})\b',n))
+                match=re.fullmatch(r'(\d{1,2})[-/](\d{1,2})[-/](\d{2}|20\d{2})',n)
+                if match:
+                    yr=int(match[3]);years.add(2000+yr if yr<100 else yr);m.add(int(match[2]))
+        fn=norm(filename)
+        fm={mn for token,mn in months.items() if re.search(r'(?<![A-Z])'+token+r'(?![A-Z])',fn)}
+        fy={int(y) for y in re.findall(r'\b(20\d{2})\b',fn)}
+        expected_y,expected_m=map(int,period.split('-'))
+        detected_m=m or fm;detected_y=years or fy
+        if len(detected_m)>1 or len(detected_y)>1 or (detected_m and detected_m!={expected_m}) or (detected_y and detected_y!={expected_y}) or (m and fm and m!=fm):
+            issue('period_conflict','El período de esta hoja no coincide de forma única con el seleccionado; no se propone su importación.',sheet,severity='error',details={'selected':period,'printed_months':sorted(m),'printed_years':sorted(years),'filename_months':sorted(fm),'filename_years':sorted(fy)})
+            return False
+        if not detected_y:issue('year_from_selection','El archivo no imprime un año. Se usa el año del período seleccionado.',sheet,severity='info',details={'period':period})
+        if not detected_m:issue('month_from_selection','No se detectó un mes en la hoja ni en el nombre; se usa el período seleccionado.',sheet,severity='info',details={'period':period})
+        return True
+    def resolve_name(name,records):
+        n=key(name)
+        exact=[r for r in records if n and key(r.get('name'))==n]
+        if len(exact)==1:return exact[0]
+        tokens=set(norm(name).split());matches=[]
+        for r in records:
+            nt=set(norm(r.get('name')).split())
+            if tokens and nt and (tokens<=nt or nt<=tokens):matches.append(r)
+        return matches[0] if len(matches)==1 else None
+    def get(row,c):return row[c-1] if c and c<=len(row) else None
+    # Workbook cell access deliberately excludes drawings/charts: malformed charts
+    # in the supplied Jorge file must not prevent reading its valid cell values.
+    loaded=[]
+    if str(filename).lower().endswith('.csv'):
+        for enc in ['utf-8-sig','cp1252']:
+            try:content=raw.decode(enc);break
+            except UnicodeDecodeError:content=None
+        if content is None:raise ValueError('No se pudo leer el texto del CSV.')
+        try:dialect=csv.Sniffer().sniff(content[:12000],delimiters=',;\t|')
+        except csv.Error:dialect=csv.excel
+        grid=list(csv.reader(io.StringIO(content),dialect))
+        loaded=[{'name':'CSV','grid':grid,'formulas':grid}]
+    elif str(filename).lower().endswith('.pdf'):
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(raw)) as doc:
+            if len(doc.pages)>200:raise ValueError('El PDF de cuotas supera 200 páginas.')
+            out['metadata']['page_count']=len(doc.pages)
+            for pn,page in enumerate(doc.pages,1):
+                for tn,table in enumerate(page.extract_tables() or [],1):
+                    grid=[[text(v).replace('\n',' ') if v is not None else None for v in row] for row in table]
+                    loaded.append({'name':'Página '+str(pn)+' · Tabla '+str(tn),'grid':grid,'formulas':grid})
+        if not loaded:
+            issue('pdf_without_table','No se encontró una tabla de texto en el PDF. Si es una imagen escaneada, necesita una captura revisada.',severity='error')
+    elif str(filename).lower().endswith(('.xlsx','.xlsm','.xls')):
+        if str(filename).lower().endswith('.xls'):
+            import pandas as pd
+            frames=pd.read_excel(io.BytesIO(raw),sheet_name=None,header=None,dtype=object,engine='xlrd')
+            for name,frame in frames.items():
+                grid=[[None if (isinstance(v,float) and math.isnan(v)) else v for v in row] for row in frame.values.tolist()]
+                loaded.append({'name':str(name),'grid':grid,'formulas':grid})
+        else:
+            import openpyxl
+            data=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True,keep_links=False)
+            forms=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=False,keep_links=False)
+            try:
+                for ws in data:
+                    if ws.max_row*ws.max_column>2_000_000:raise ValueError('La hoja '+ws.title+' supera el tamaño de lectura admitido.')
+                    if ws.max_row>20000 or ws.max_column>300:raise ValueError('La hoja '+ws.title+' tiene demasiadas filas/columnas para una planilla de cuotas.')
+                    grid=[list(row) for row in ws.iter_rows(values_only=True)]
+                    formula=[list(row) for row in forms[ws.title].iter_rows(values_only=True)]
+                    loaded.append({'name':ws.title,'grid':grid,'formulas':formula})
+            finally:data.close();forms.close()
+    else:
+        issue('unsupported_format','Este lector necesita un Excel o CSV. Las imágenes/PDF sin tabla requieren captura o conversión revisada.',severity='error')
+        return out
+    # Read individual identities before summaries, allowing unambiguous linking
+    # of summary names to an explicit numeric route/sheet in the same workbook.
+    details=[]
+    for item in loaded:
+        grid=item['grid'];name=item['name']
+        if summary_context(grid):continue
+        bhr=next((i for i,row in enumerate(grid[:40],1) if key(get(row,1)).startswith('MARCAS') and key(get(row,2)) in {'META','CUOTA'}),None)
+        if not bhr:continue
+        code='';advisor='';route='';sup=supervisor(grid)
+        if re.fullmatch(r'\d{3}',text(name)):code=text(name)
+        for row in grid[:bhr-1]:
+            label=text(get(row,1));k=key(label)
+            if k.startswith('ASESOR'):
+                value=text(get(row,2)) if key(get(row,2)) not in {'META','CUOTA'} else ''
+                value=value or re.sub(r'(?i)^ASESOR\s*:?\s*','',label).strip()
+                codes=re.findall(r'(?<!\d)(\d{3})(?!\d)',value)
+                if codes:code=code or codes[0]
+                advisor=re.sub(r'(?<!\d)\d{3}(?!\d)','',value).strip()
+            if k in {'RUTA','CODIGO','CODASESOR'}:
+                val=text(get(row,2));num=number(val)
+                if num is not None and num.is_integer():code=str(int(num))
+                route=val
+            if k.startswith('ZONA'):
+                # Header can include zone and a shortened name; the sheet title
+                # is often the unique advisor's first name (e.g. DANNY).
+                route=re.sub(r'(?i)^ZONA\s*:?\s*','',label).strip()
+        advisor=advisor or (name if not re.fullmatch(r'\d+',name) else '')
+        metric_vals={}
+        for row in grid[:bhr-1]:
+            k=key(get(row,1));v=number(get(row,2))
+            metric={'CLIENTESACTIVOS':'active_clients_goal','CLIENTESNUEVOS':'new_goal','MONTOVENTAS':'sales_goal','LINEAS':'line_count_goal','ACTIVACION':'activation_rate_goal'}.get(k)
+            if metric and v is not None:metric_vals[metric]=v
+        details.append({'item':item,'bhr':bhr,'code':code,'name':advisor,'route':route,'supervisor':sup,'metrics':metric_vals})
+    # Explicit supervisors printed on individual sheets may identify the same
+    # workbook's summary, but filenames never create an assignment.
+    printed_supers={d['supervisor'] for d in details if d['supervisor']}
+    summaries=[];summary_sheets=set()
+    for item in loaded:
+        grid=item['grid'];sheet=item['name'];cfg=summary_context(grid)
+        if not cfg:continue
+        summary_sheets.add(sheet)
+        valid=period_ok(grid,sheet)
+        out['sheets'].append({'name':sheet,'classification':'advisor_summary','period':period,'period_valid':valid})
+        if not valid:continue
+        sup=supervisor(grid)
+        if not sup and len(printed_supers)==1:sup=next(iter(printed_supers))
+        if not sup and sheet.strip().upper()=='CUOTAS' and len(grid)>=4:
+            candidate=text(get(grid[3],2))
+            if candidate and not number(candidate) and not any(key(candidate)==key(v) for v in months):sup=candidate
+        members=[]
+        for rn in range(cfg['row']+1,len(grid)+1):
+            row=grid[rn-1];aname=text(get(row,cfg['name']))
+            if not aname:continue
+            if key(aname).startswith('TOTAL') or any(key(v).startswith('TOTAL') for v in row[:max(3,cfg['name'])]):
+                for metric,col in [('active_clients_goal',cfg['portfolio']),('new_goal',cfg['new']),('sales_goal',cfg['sales']),('line_count_goal',cfg['lines'])]:
+                    val=number(get(row,col));vs=[m['metrics'].get(metric) for m in members if m['metrics'].get(metric) is not None]
+                    if val is not None and vs and abs(val-sum(vs))>.011:issue('summary_total_mismatch','El total de metas no coincide con las filas de asesores.',sheet,[cell(rn,col)],details={'metric':metric,'reported':val,'calculated':sum(vs)})
+                # Actual totals are evidence, never target rows.
+                for metric,col in [('active_clients_goal',cfg['portfolio']+1),('new_goal',cfg['new']+1),('sales_goal',cfg['sales']+1),('line_count_goal',cfg['lines']+1)]:
+                    val=number(get(row,col));vs=[m['actuals'].get(metric) for m in members if m['actuals'].get(metric) is not None]
+                    if val is not None and vs and abs(val-sum(vs))>.011:issue('actual_total_mismatch','El total de logros no coincide con las filas; no se utilizará para calcular metas.',sheet,[cell(rn,col)],details={'metric':metric,'reported':val,'calculated':sum(vs)})
+                continue
+            codeval=get(row,cfg['code']) if cfg['code'] else None
+            num=number(codeval);ref=str(int(num)) if num is not None and num.is_integer() else text(codeval)
+            if not ref:
+                match=re.match(r'^\s*(\d{3})\s+(.+)',aname)
+                if match:ref=match[1];aname=match[2].strip()
+            metrics={metric:number(get(row,col)) for metric,col in [('active_clients_goal',cfg['portfolio']),('new_goal',cfg['new']),('sales_goal',cfg['sales']),('line_count_goal',cfg['lines'])]}
+            if not any(v is not None for v in metrics.values()):continue
+            linked=None;method='explicit_code' if ref else None
+            if not ref:
+                linked=resolve_name(aname,details)
+                if linked and linked['code']:ref=linked['code'];method='unique_name_in_workbook'
+            if not ref:
+                # A summary with no codes can be linked to a numeric detail
+                # sheet only if at least TWO independent positive targets
+                # (including sales) agree uniquely. Never positional matching.
+                matches=[]
+                for d in details:
+                    same=[k for k,v in metrics.items() if v is not None and v>0 and d['metrics'].get(k) is not None and abs(v-d['metrics'][k])<.011]
+                    if d['code'] and 'sales_goal' in same and len(same)>=2:matches.append(d)
+                if len(matches)==1:
+                    linked=matches[0];ref=linked['code'];method='unique_targets_with_numeric_detail'
+                    issue('identity_link_by_targets','El resumen no trae código; se propone el código de una ficha única que coincide en venta y otra meta. Revisa la identidad.',sheet,[cell(rn,cfg['name'])],details={'advisor_ref':ref,'summary_name':aname,'detail_sheet':linked['item']['name']})
+            ref=ref or aname
+            actualvals={metric:number(get(row,col+1)) for metric,col in [('active_clients_goal',cfg['portfolio']),('new_goal',cfg['new']),('sales_goal',cfg['sales']),('line_count_goal',cfg['lines'])]}
+            rec={'ref':ref,'name':aname,'supervisor':sup,'metrics':metrics,'actuals':actualvals,'row':rn,'sheet':sheet,'link_method':method}
+            summaries.append(rec);members.append(rec)
+            for metric,col in [('active_clients_goal',cfg['portfolio']),('new_goal',cfg['new']),('sales_goal',cfg['sales']),('line_count_goal',cfg['lines'])]:
+                add(metric,get(row,col),ref,aname,sup,sheet,cell(rn,col),get(grid[cfg['row']-1],col),'summary',identity_method=method)
+                add(metric,get(row,col+1),ref,aname,sup,sheet,cell(rn,col+1),'Logro / '+str(get(grid[cfg['row']-1],col)),'summary',actual=True,identity_method=method)
+    # Individual sheets: explicit code wins, otherwise exact/unique shortened
+    # name against this workbook's summary. Names stay as source evidence.
+    detail_sheets=set()
+    for d in details:
+        item=d['item'];sheet=item['name'];grid=item['grid'];bhr=d['bhr'];detail_sheets.add(sheet)
+        valid=period_ok(grid,sheet)
+        out['sheets'].append({'name':sheet,'classification':'advisor_detail','period':period,'period_valid':valid})
+        if not valid:continue
+        matches=[s for s in summaries if d['code'] and s['ref']==d['code']]
+        owner=matches[0] if len(matches)==1 else resolve_name(d['name'],summaries)
+        if not owner and not d['code']:
+            aliases=resolve_name(sheet,summaries)
+            if aliases:owner=aliases
+        if not owner and not d['code']:
+            matches=[]
+            for s in summaries:
+                same=[k for k,v in d['metrics'].items() if v is not None and v>0 and s['metrics'].get(k) is not None and abs(v-s['metrics'][k])<.011]
+                if 'sales_goal' in same and len(same)>=2:matches.append(s)
+            if len(matches)==1:
+                owner=matches[0]
+                issue('detail_identity_link_by_targets','La ficha sin código se relaciona con un resumen único por venta y otra meta coincidente. Revisa el nombre.',sheet,details={'advisor_ref':owner['ref'],'summary_name':owner['name'],'detail_name':d['name']})
+        ref=d['code'] or (owner['ref'] if owner else d['name'] or sheet)
+        advisor=d['name'] or (owner['name'] if owner else '')
+        sup=d['supervisor'] or (owner['supervisor'] if owner else '')
+        if owner and d['name'] and not resolve_name(d['name'],[{'name':owner['name']}]):
+            issue('detail_identity_conflict','El mismo código tiene nombres distintos entre resumen y ficha. Se conserva el código y ambos nombres para revisión.',sheet,details={'advisor_ref':ref,'summary_name':owner['name'],'detail_name':d['name']})
+        if not re.fullmatch(r'\d{3}',ref):issue('advisor_identity_pending','La ficha no contiene un código identificable de forma única.',sheet,details={'advisor_ref':ref,'name':advisor})
+        detail_metrics=[]
+        for rn,row in enumerate(grid[:bhr-1],1):
+            label=text(get(row,1));k=key(label)
+            metric={'CLIENTESACTIVOS':'active_clients_goal','CLIENTESNUEVOS':'new_goal','MONTOVENTAS':'sales_goal','LINEAS':'line_count_goal','ACTIVACION':'activation_rate_goal'}.get(k)
+            if not metric:continue
+            obj=add(metric,get(row,2),ref,advisor,sup,sheet,cell(rn,2),label)
+            if obj:detail_metrics.append(obj)
+            # Johana's third column contains "22 DIA HABILES" and blanks;
+            # only a numeric value is retained as a reported achievement.
+            add(metric,get(row,3),ref,advisor,sup,sheet,cell(rn,3),'Logro / '+label,actual=True)
+        line_values=[];line_actuals=[];stated_total=None
+        for rn in range(bhr+1,len(grid)+1):
+            row=grid[rn-1];label=text(get(row,1));k=key(label)
+            if not label:continue
+            if k.startswith('TOTAL'):
+                stated_total=number(get(row,2));actual_total=number(get(row,3))
+                if stated_total is not None and line_values and abs(stated_total-sum(line_values))>.011:issue('line_total_mismatch','El total de cuotas por línea no coincide con sus celdas individuales.',sheet,[cell(rn,2)],details={'advisor_ref':ref,'reported':stated_total,'calculated':sum(line_values)})
+                if actual_total is not None and line_actuals and abs(actual_total-sum(line_actuals))>.011:issue('actual_line_total_mismatch','El total de logros por línea no coincide con las filas. Se conserva como evidencia.',sheet,[cell(rn,3)],details={'advisor_ref':ref,'reported':actual_total,'calculated':sum(line_actuals)})
+                break
+            obj=add('line_sales_goal',get(row,2),ref,advisor,sup,sheet,cell(rn,2),label,line_name=label)
+            if obj:line_values.append(obj['value'])
+            obj=add('line_sales_goal',get(row,3),ref,advisor,sup,sheet,cell(rn,3),'Logro / '+label,line_name=label,actual=True)
+            if obj:line_actuals.append(obj['value'])
+        sumlines=sum(line_values) if line_values else None
+        if owner and sumlines is not None and owner['metrics'].get('sales_goal') is not None and abs(owner['metrics']['sales_goal']-sumlines)>.011:
+            issue('summary_vs_line_goals','La meta de venta del resumen difiere de la suma de las cuotas por línea; no se suman ni se sustituyen automáticamente.',sheet,details={'advisor_ref':ref,'summary':owner['metrics']['sales_goal'],'lines_sum':sumlines})
+        if owner:
+            for obj in detail_metrics:
+                top=owner['metrics'].get(obj['metric'])
+                if top is not None and abs(top-obj['value'])>.011:
+                    issue('goal_alternatives','Resumen y ficha indican metas diferentes. El resumen es la propuesta principal; la alternativa se conserva.',sheet,[obj['source_cell']],details={'advisor_ref':ref,'metric':obj['metric'],'summary':top,'detail':obj['value']})
+        if sumlines is not None:
+            salesdetail=next((r for r in detail_metrics if r['metric']=='sales_goal'),None)
+            if salesdetail and abs(salesdetail['value']-sumlines)>.011:issue('detail_total_vs_lines','El monto de venta escrito en la ficha no coincide con la suma de sus cuotas por línea; no se reemplaza la meta del resumen.',sheet,[salesdetail['source_cell']],details={'advisor_ref':ref,'stated':salesdetail['value'],'lines_sum':sumlines})
+    # Flat standardized templates. Multiple recognized sheets are all read.
+    aliases={'CODIGO':'advisor_ref','CODIGOASESOR':'advisor_ref','CODASESOR':'advisor_ref','COD':'advisor_ref','ADVISORCODE':'advisor_ref','ASESOR':'advisor_ref',
+        'NOMBRE':'advisor_name','NOMBREASESOR':'advisor_name','SUPERVISOR':'supervisor','PERIODO':'period','PERIOD':'period','MES':'period',
+        'METAVENTAUSD':'sales_goal','METAVENTASUSD':'sales_goal','METAVENTA':'sales_goal','CUOTAUSD':'sales_goal','SALESGOAL':'sales_goal','CUOTA':'sales_goal',
+        'METANUEVOS':'new_goal','METACLIENTESNUEVOS':'new_goal','NEWGOAL':'new_goal','METAACTIVADOS':'activation_goal','ACTIVATIONGOAL':'activation_goal',
+        'METACLIENTESACTIVOS':'active_clients_goal','ACTIVECLIENTSGOAL':'active_clients_goal','METACARTERA':'active_clients_goal',
+        'METACOBROSUSD':'collections_goal','COLLECTIONSGOAL':'collections_goal','METAVISITAS':'visits_goal','VISITSGOAL':'visits_goal',
+        'METALINEAS':'line_count_goal','METAMARCAS':'line_count_goal','LINECOUNTGOAL':'line_count_goal','ACTIVATIONRATEGOAL':'activation_rate_goal','META ACTIVACION':'activation_rate_goal','METAACTIVACION':'activation_rate_goal'}
+    for item in loaded:
+        sheet=item['name'];grid=item['grid'];formulas=item['formulas']
+        # Formula diagnostics do not evaluate code or turn missing values into0.
+        for rn,row in enumerate(formulas,1):
+            for cn,v in enumerate(row,1):
+                cached=get(grid[rn-1],cn) if rn<=len(grid) else None
+                if isinstance(v,str) and v.startswith('=') and (cached is None or (isinstance(cached,str) and cached.startswith('#'))):
+                    issue('formula_result_unavailable','La fórmula no tiene resultado numérico guardado o contiene un error; no se convierte en cero.',sheet,[cell(rn,cn)],severity='info',details={'formula':v,'cached':text(cached)})
+        if sheet in summary_sheets or sheet in detail_sheets:continue
+        if not any(text(v) for row in grid for v in row):out['sheets'].append({'name':sheet,'classification':'empty'});continue
+        header=None;mapping=None
+        for rn,row in enumerate(grid[:40],1):
+            cols={i+1:aliases[key(v)] for i,v in enumerate(row) if key(v) in aliases}
+            if 'advisor_ref' in cols.values() and any(v in units for v in cols.values()):header=rn;mapping=cols;break
+        if not header:
+            out['sheets'].append({'name':sheet,'classification':'unrecognized'})
+            issue('unrecognized_sheet','No se reconoció una tabla de cuotas en esta hoja. Se conserva pendiente de mapeo.',sheet,severity='info');continue
+        valid=period_ok(grid[:header-1],sheet)
+        out['sheets'].append({'name':sheet,'classification':'flat_goals','period':period,'period_valid':valid})
+        if not valid:continue
+        values=list(mapping.values())
+        if len(values)!=len(set(values)):
+            issue('duplicate_goal_headers','Dos columnas representan el mismo dato de cuota; revisa el encabezado.',sheet,[str(header)],severity='error');continue
+        for rn in range(header+1,len(grid)+1):
+            row=grid[rn-1];record={field:get(row,c) for c,field in mapping.items()}
+            ref=text(record.get('advisor_ref'));num=number(ref)
+            if num is not None and num.is_integer():ref=str(int(num))
+            if not ref or key(ref).startswith('TOTAL'):continue
+            stated=text(record.get('period'))
+            if stated:
+                if isinstance(record['period'],(datetime.date,datetime.datetime)):stated=record['period'].strftime('%Y-%m')
+                if stated!=period:
+                    issue('row_period_conflict','El período de la fila no coincide con el seleccionado; se excluye esta fila.',sheet,[cell(rn,next(c for c,f in mapping.items() if f=='period'))],severity='error',details={'reported':stated,'selected':period});continue
+            for c,metric in mapping.items():
+                if metric not in units:continue
+                value=get(row,c)
+                if text(value) and number(value) is None:issue('invalid_goal_value','La meta no es un número válido; queda pendiente.',sheet,[cell(rn,c)],details={'metric':metric,'reported':text(value)})
+                add(metric,value,ref,record.get('advisor_name'),record.get('supervisor'),sheet,cell(rn,c),get(grid[header-1],c),'table')
+    actual_groups={}
+    for rec in out['actuals']:
+        identity=(rec['advisor_ref'],rec['metric'],key(rec.get('line_name')))
+        actual_groups.setdefault(identity,[]).append(rec)
+    for identity,items in actual_groups.items():
+        tops=[x for x in items if x['origin']=='summary'];detail=[x for x in items if x['origin']=='detail']
+        if len(tops)==1:
+            for alt in detail:
+                if abs(tops[0]['value']-alt['value'])>.011:
+                    issue('actual_alternatives','Resumen y ficha contienen logros diferentes. Se conservan como evidencia y no cambian los resultados del reporte de ventas.',alt['source_sheet'],[alt['source_cell']],details={'advisor_ref':identity[0],'metric':identity[1],'summary':tops[0]['value'],'detail':alt['value']})
+    out['metadata'].update(candidate_count=len(out['candidates']),actual_count=len(out['actuals']),recognized_sheets=sum(s['classification'] not in {'unrecognized','empty'} for s in out['sheets']),advisor_refs=sorted({r['advisor_ref'] for r in out['candidates']}))
+    if not out['candidates']:issue('no_goals_detected','No se detectaron metas importables para el período seleccionado.',severity='error')
+    return out
+
+
+# NEXUS 5.4 · Metas de supervisores, unidades y procedencia.
+_NX54_SHARED_GOALS_B64 = 'eNrsvV1zXDeS5/1VarV7sRvhZSMBZCbQE3NBy7Sttix1U7J3XqJDkQASNh9TZA8pucfTMR/mudyLuZiYu+fWX+zJQ71SKrGOrKpTUp1y2DLFKh4C+BWQmfgnEv/8t1uP9Yk0eSK3fv+3W/3kVM/ksd76/a3bd46Oj48W928//O5z+/8f7j84Whw+eHB49+BfTy//9dZnty5/FI9k7yw11yStpBQllpZrpN6Sl9q6ZlBIrvWMQpqCE3aSSnQxqmCC1Dw6e9Zf9OLkvNmzvPP0v+HqW3JxqRePftaLy5PzM3sJD+LB8MJPJ2fDO384l9NL+2uVs3Zi7ddH9fzp2ZNbv4/42S2pT57K6cvv8Ge3LrSe/3B28m/aHl3+qPrk0r5t72s/n1yeXzy60G7f+Odb4II9EhwOf4Z468///tovGN7xt1snwy8HEJakJCS+xRYccWic1X7MhvPipNp7rA0nP1urTk/07Mnlo6G99vLPcvrUhje6A/fZradnJ9a8W8/eokNvXmvQ8GuumvPie8/BHN49+ofDe18cHS++Pbzzx8OBxFMbv6v32MsDqOF7508vqj4agI6C+eztxnQ9QF8+z4bannhuPMqFLl69UvX01F74gl5961SKDt+7fXj88Oh46Nj5xckPJwP7y6ePH8vFL8PHwj4oFydPfrn1e3Bu6QfnpNlg2jseGYkfr17Tf/3L6Uk9eWKfh6a3/v2z5xBZY03omByEpLFL774I1Nchnulf3yDn9+AGSF8tAfft0cPDxe27d47uPTxa3Pvu6Pv7G2cIJbtYnErPLUtvOUVEX+F1hpdyqm/OP+/sn9dIfvfgixlC/MMyiPfvPby/OLq3+N4wHj5Y3P7uvlH9HxsnGaKHSKQ+xV46UiEoKau8TvL05Oz5Mv8GzvAayuFNMscp+e2ytXSg98B6d3z78MHGGVLlSrnbBOToKCd2CjH0ON4sxnGrK76N8v4DsxuLb4++uHPvU7eJvD2bWKkJIkfFTsqlutIzEeJabOJOU/uKPwqDmMVHLV6wthRrGXyb5m0hXWUQs/cjDOJOE/wDfzzWUBm4psQUc6bme2y1ey9xlDUEGmMOd5rlt7xtW8jmkUroHHILPtWCNUakzKNtoQ+jVtUQ3+Z4xcH6eedw8e2du3ePHn7iBjFtzyCqeFfBV5TsWw6tgHjW4tZhEGeA7qv0UVjFxDln13tkW0rVpeBLSa7mtYSJM8D4h/TxmEbwBUOOAXKsahEiJbWvwa8tUJwBz2/Tts2jJOucug6t5OqkN4q9Ss+T7qB+EhCvtfYaxc/9EorP1tUHi8PbD+98f/8ayKZP5OT0Gse0DOMrSJrIplejmoorkUJt4msMG98h/dTBhBvAXFm8D+Oiia0PWgBZkwMN7ALHSJvf9fzUwcR32bFnRuzDZgsUSsQlWSg9GKisLjqANM0O5qdOBt8mc/fOvaMPZFJiy9pzbB6yRWJSxYek16OwKybLpkuY+2yBJdPlyzt3Hx7ff7D4/P6D34Tms2fj/Xyorj3tlRZANcRYwGxPDDVA5Rwk+jCKGvi5Y/PubWz/5+jzD6c1POQlJJ8dSXciGX2oqTtqlJXdKEg4e0awxBJZZHF4/MWHc3rxoFfCTEPsoZZE0LI5DB1LURfeQ5jBD9vi/yRwvWzptF52yr5TCuZZc4ZSK+QUWXO/2csO8wWyYe+aQgS0BSono1EagnnWmtVvVkL5lIFs0quuw/ALF8wxeWXuzhrYrwta71ZC8EOUkE8ZyWbcaXHqs2qnYutUybliJ09tnDs9yi/bRRZLtKjDL+7Y3PhwS//8OS8BWRcGy96bL0rZYfaC3L2Mc8pwroSWbIfetQbeuX04GJUPx/T6w17ZGZ/BuiWsobfMOQ9pFwxlfbHpLqLKb6N6cPjl4fGdD6f0/DmvIpzuoUnLau3PzULREn1BhHFh6FwBgVum1n5+98je/uGMXj7plYNQUghA0VtAQ+YkgA9osSnup9GNlJbEn18cfncVqn4gomePecmn9w42kwaHwVHMVFsUACf7WXQjnyVR59G3fzy+/8U67NHLJ73KG4OIapPHTFEvTnJRAO6lrm83Zycphe1skHouqqkLNuIoEsQH62aTsbTmCWtJmHrn+zvrsErPHvMKj5I46Fwci7U5de7B5QCj96/nyWdJzPrHo68Ovz269/D+GqbSa896pTQAoxSXkhmoUrBVza1W1f1EugnUkoMGZk4O792/++GUXjzo1faodIPUzb0rufraVUk1YB43mWbLaMmmw4M/rSFG+tNru0EIoblYs/SI5nZ3DR4Lt71ndyOZJZsN33/54WTsGa9k71KYCpUsyUyQT5qaFky6RgF1J9HkKYTT0Kl2EKrILadaeuGOIG3vat+owrkpBVPAiq1jj82nXAKL9qKxxb1fcBOiJXsKNqwPHtxfw073iwe92uqGEJOyZ1eEghvOO5VcrucBb+qAxSeUA/yqqdOq2pU6FMistSQFMGvEzlrImzo4sQNINp012rvUZE1vXqRiyJ1yqR03dghiB5BsUtnmlnIA9DlT8tmmi9iXdYn7vM6DDDvAZDPSNmDC5KN6QvuP0IsvHjqsTdreURpbyxEVkM7ZVU5M6noVJUrU1hfi7KrhnyQ7NCo1HzukMCxpOVaH2gTH7VDTjOlMkhf65xclsl6raVXAIlLIIWJRxwwOsutacbQ/DbAvjXQl0y3ZHr17/sPF+eJ3i6mOLTebd6mJmheeVHMrwcxZDnqz970vSnYF8OsbAG7h8LL0lIZTXkXA+e4lWsc4UlnltyePcJDjzGtcfXMTzC0dYXbiXNJSI7uYq7BQRg2972tdjaV676Y1dtKDzJmYwLydGl0K1QsqBjJPdPw2FO2rJ9064u3bzM7ifAvQhJNXHxEqg6f12Mydpvc1f1QG07xWlwcjmZNDVBnqtlQpK6t9EARIB5znXATrG/74zGVpPodgDlA3qql6pz2H5EYeAYHZF8O6xx+LsXQ1exdCZe4ZhhilsbpY+2hjyfvCSs8NZtq+wQwpldZtYqZetDeoRBaisNxsMGGP8LnVTB+V1dTEnTOTN544nMDvQw99XWU1wUeXD3j2NbK+SR+f5cTiVDuA+bJqFjT7DIiN+75W1ntYz/SxWE+o1RcIAavz3Er2VB2hb5Pu0H7ihRdu+xtorjP/IdSUa9FgwWQShe68zwiramfti5rdDiMArSEbomTRZosjB+dTBIswCLRdz0/ZzK7qpw4orrJza8iNCGZZcraAL2MDi/xySl1ybvtaWmMI4bsJrSFTInXzJ5oGR6F5CL3CULqR/bgDl/4AaMaTZ9np2BdsNnWOmaIRwgA1hdK4Qc+up1jHnaDI4SDPmdcNq90UaS69U09DJNYaWF971KGQ3djTLxaYBT9nejf47us+DWOcIHPNjE4KDn1qamvjuNoo0X7sgOeMyt+wMK4/PQmpZIWasdfkNMaAmZsIjCwaEN1BmrML6G9w0i9/+uXDYQ0PeZVL5jDEEFqsHnPkodg3qE/TSayf8KGMyeLdHKz1uXfoIXVvjSzAqVa3UfX0UwYzVZzraunONwmqhVOyuJeya3XDYuinTGaKADcFEm4lYkdpHCQP7kMCmkDT/JTRbDiyNe8tQ29FqhJFT7XGUvs4Z3uWZ/5u3yAtb6rGnZdojecsXswxsD+KCzWODIlCTujnuazdEAttvthdrt5DNVJNXM8Va03YXB13XMN7RwchzZBZnn63SJw1OLoOpVNlEJ+ES5SyXwTfSemmTb1Nlr5DBQ2aPLPqcEydYg21tpFFu7w/yH6OtODdtDZTAq9V9eo5m099dU+1Jgm+jNyARRdnOqtuCF03WQrPD5UehoO5ZdhysM6qIrfQx5kqRjwIcY64wnZ3yiVaL5rXjBhQbRVMlUMbWRNvpjPshkh3M5XxGNXC3ig1Y3Q+JguBe6s9jXQD0wHN0mLdEPZuvEJeDaHECNgpuRoFicDbEjlSgIrpAHiOyG44oLS5WnlSamGkEDt7171Sr+y9jJPmo48Hfo6BMfB0KmFvtvaVHkPuicgFgTDcCq0jkyciHsAsV8AbNi/WXTyPq02gQs3lHlMC6aEzdR15sVXKdOBojojylAKu9xjBQ7VwilqPJG0Iges4by/nA5ghoZsk9s2V0kvqfEut1qtbGDk3x1SK63u//N2gbtih2FxBPcXiXcogyFRjrMgloL9+q+yGDmd9+oVbJtPZpaMzSjIU55dKxIWluev3Yf1WnX1H0UyktLshqO3RWajEFLzvoFEblo0doNoBNFNI7VBrFUq9NYYSKHkzQC2D29fZu5nNZrV27yAlCkQg0ScOrSc1J2Hk7VdhnuXBtp6O3MwtoJp865JLAwnBUzSMY3eDoj/IMEty0+a3tpY5FYYhOwKo14ouxzcO876bU7b5tSpFYlcxwZQx0p8/u3VyeflUn5Xhuzrt+ftbv6hcPOoX548fXeqpmsN9fnaF7fJSfrhSrE4XclF/PPn5fHF2vjh5bL/6sS6eni3k1/88P1g8sK8vZaGnV39fNPvCmvPrf5y388XVA6s9UNr5wQcwuenI7NAX69el/qzPBuTWyVk/t/c8Gyt7+W9LzMLwyf3U+v+OBOn5DMCS8PWDOz8sRY/k9IlenMkQa15e6/qxXj59rGeLXxb9pP4oi5OzdlLlbGGLmlwu2knXi6vY5mBhg3Tx/M16uTiVxV8uzv9iM+3J8NXJWT35i5z+3fD9V79LbHgW9fzs0tYu2djoDKXXr4/QX+Xi7OTsh+uDtGyfY0UY/uLQ+e9jHNyj52vT1d3tMxvh8MEj/FoI/XJY/eujGmY3qPjBg/p2lPVybIFeH1x44yP7yayIy9yKD14S+/nF46en8mj4YJw+efT0TH62n5NyqtcG4a4s+q//dfXWYRSe2Nqgi2c/Y31bnD19/Ov/NQ7nix+eykUbvnU+fGyevc/GSi8uzi/+bvjRZ5+nn0/04oku7JNY9WJz1uLWF/7NBfHt8Xk+BPba39/58n9+7v3fu8/cZ7e9/519/b/svVXqjzoM4H///vDud0f/bV4DGN57AMPzAQw2gGE/gPG9BzA+H8BoAxj3A4jvPYD4fADRBhBXDuCzcuXjLeyLUTlbnA7R23Uj++CVvbSROX98vtCfhyo89UTsATZ6VR6XExl+9vLV8F9eGY4L/cv5MKZNFz/b4+Ryc0Zj2Ll+f5Mb4io/Bl43tW6wtMNvGRrzLA59HqW+Ft7VU7m8PLGRlSvT+/uXv/O1Okdvh7zPvvXoZzkd9iSeXDzVAeiSs7DvfPyr8Po9n/7ig7r+J7+Eta5H/3l4+OAINnkiVxPFPkUvUr6v6oR9e/Rg8cXR4uUHarE4Pvrqzv17i2H8Hrz8UP0oHmk4alFaj5F8dQBRXfeSJXVIxSXvEnQpUjl47LHHUnppTXyojmuo0HOmd7RcLmzCPLKP4uWz7uKBRRn2wk/mzD53gC+vZrH5ttaV546ehR/04rKB179zofX8h7OTf9P26MUnL1zbY7qaABCG1kBIt2yUXj36tVsL2JFmRmo+xZIS+24tTtcL3d8oWoY0Thqjt7e7vjw+vHf7zoPb99/Y8Tp7enr61prwPiRf3/paA803lpvbtjRenJ8OK9j3VyvYqCt2pioq6YfjqqTqe+3UUre+FOCON+ubcQ/xrQqhSyAOZSUnKDrYOFL0rg9FFiJqZ1dIdJUOOuZqy1kR/HrZNJyociRHDZUT1couJOTCPojEcQW4hvB9tWo6J5TfvAvlxkESiUBOVTBoSq01hd7T9WzGm4tG5nFra3ob51ffPXh4+P3umUfaonksvhX0pEBcRVPwNkl957WYx/kgXHZH0yTGsZVq/ULxsZnT2kUDhRaLrMU4zoffsiuapjKNIVlPSWLpIVGKnHJM0pZkrvx20zgfkN/Q1gyjK5yi9TT7WsWBxY4NHfl95PhOnM/6MvFF0o47ORcZfMZaktGCJBl5HxCuZrPhG6VdKdn8SupVlX0lqCkBXb+CfR/pLUezyZulcxwKDSRhjijWOsyRoHjcB29j6WzmjmmOhN4iaQ+YfObqu8tk7Rx7x/Tc58ySc5rPikP97tv7D+8ff3P/4dG6yk299sTX6ih789SHREoLvnrCCBZaJ8CRV06n2fNbdohz45Wnovl2PbMPhcXMVa9RSuw8jlraT7olxzo3VXrKAimqWDg76V2BXWfOMvLk7X59/HxZHapN1p+SHDjVGJvzqCnan9WlFHXPaySvJcnmm6lAhVp71tK0q/fB9+J7i6rjPA/APaklUe4ma1DljtoxuO4qkHJL2NGlkSvhntfny4pRTXE+SrkEcaQl+tBa8xhd6U7SSBdxz21JWLyZSlS2HiZbEEvubJycV2toYj/uBgDY+/LLalJtuhZVrIhKTNpAIlTU4nrFhPtVcSSzJZvtmytGlXIaDlxXf6V1mcOBKhmw7wOvkbSWbHesuxwVcyVzCBsUi4/VuwYuW+iV9zNqJKMlWxrrrkflkoBoUOHqYvXmXNTqkxtnqfye0bLCVOs/ce2Gy59CI9ZUbcELXXyuUnVPaaSMuGTvYnNFqXL1VRCiuNaGanzSPGvjuPfTR9Jadkx+Y5Wp0EuKanwgBlc0QmtDlSqcIofth6eXT+Tn80+NWZpeqM89CQtxkl6EuyZVxx1lU6lpu0NmwzK9oBBkqGCOXq3J1YZiTl/aVM7Z7oDZpEgPWLU3Sl4Uko/SAhDQkjLza00j2x02m5HoteeSFFxPvsQM1HqXmhquTdLYaSZbFugN2nBVg2p15s45ESRQ0ZG1yr2fOb2tyPNsbsNQERZq9y4KOA++deWRFcXmPuMmVOfRzFRSV82zE98wg+Jw+KCvLWbaaVBTa/MpFXQSNdVYWxBKwfkcctjTGkVrMmW+xuEyKOypu8gpUqkpkRfecxrFaWJd3t4G5ig0Ee2uZWhegzSII2/ymjutLanyTjUFCpBZrC/KEq03nOPa9mZ3m9pkmnzIKZTofCCVShmCEx8Tyj74GsVpC4p8A6HMmSxC5tY9+RRk2E3fExtFbFI9HpMbDpsmTU5UnMNh7wk471fBUawmUOMdITmbTjGnnAB0yNIM7Px+No0iNIEWHxv4DthDkNBj4tQbIEbZz6FRhCZR4plLJGitp5BjjLm4QlDantE4lXBSHT45LkWbr9RbC74pk0fqcR/9jmI1iQr/5xf1214ru3al8qIEisW8PtLAMXRXxx+ef1bvd1+xa+yNK1PVl3EWeKF1DLgQBRxqJFhXywoRP+xhvgnzyxtgTlJpZrhVqkcnwWyfL84NMVpIAVap/pTAHUDe12F7ifLOTfNyoqIzaGaRqXduyXzPoaJeiqm0PCpbIO/LsV0nencV0QnKXHJk1WR/mgOEsat6iAyjDWjal/R6w3rS9q2nOt+x1+5T8+C8T9FxcNHtq7O9n+2kbdvO5NmhdRYxNAbFiqmVFlbZzgBhX6XtNcNJ2zecKbcaMIXeSnBoXq0rTtWlcWl2bl+t7ZrdpG3bTUCsxQfQWkLRGrQKFmHaB57vlcA/2XXFGHoncTn5kDTqkI3XIXbax5OrGU10b3HqXUJiaRwkVqJG4PmN0xX7QPEdjKa4wLgpYhMh6shivqUFgEkK9n3sNxLSZm8yLs4WNGtV8CCVzOsPHaPiyEoCNPezZLf53XSmTB5nSuSDef7UXfNZGrCG4MbJ4yF5OEhp3iDTDdNs43nkBVrXTsQsuYSgibNwCSOVJI5wgDxvfPnd+DaVUi6CMWPxkZVKbw5Tr0Mh2VHQZr9wgrtpx2tzqeVUUk5NfQZKzYDVKiXryHRKyHDg48zB3XDJ+GayzGnIKQrKlYRd6uy5VG8920+0UbxuiJY3mW3eUnWNLGhuAQskidYV72TkYUQ6cDRzbjdE0FPknZfOiKRRgHzOLQauqUVu+1k3it4NsfVm8s9BkLrvwxGcziGB9atyKeNWyRQPeO527YZAe9OZ6CkU8+KFwWsqgk2C51Za3M+1UeRu2NjfXEZ67VRD9xEYLOw2bs11Sjzu7FtAOpj55iPcsHWy7tz0wAEUJZErlFNszuWcC5X9/BpF6oa9kXXnqEOJqaNjVY7UhzjNp2Lza5zXmP0B+JnDumEnZP3p6h61tiKakaxfvWIIgH3kvuPsJ5a/YQ9kc2nrgRzlmimGHqRpJ8j2/zqyEG3AA5r5VrG/YQdkc3XkIqOqhtqUxfscA8RQ+PrpnQ0l3e3MoYPJMgeqMiV0NtUsbLYGAmNoqdSbMwdoT2iqvIGrzA4qEs27iC4IhWwuYtPVSXI+HySc8cGdSbIGOlZrt7kTJZRm88gNfqBzuNnEt91htNmkAQXH7BK24CtJlNy8E0M0UkPBg+jnPIE+kpyBUNX7ThUj9hy1g3Xf09iCcw7zQYhzxrjVjIHUc0APLWH0En0JUYoPfdyOBru8Wl7ZaXZbSBcomnNwuSIXKNkhMAcQXtce1E7j2layQA+BKbM6VIg1WvQlTF76ntkIZtPnCbg6aCgl24oYCBEjJxe77GmNoLWlLIEkQaWVGnMtNQfzI9vQ1zqy3gUfBJ41ti0nCXCmmNl65qu4LlDAF2kysqTgzOOA6XMEXCkSkTs08/YpIDv2Fd04XAkPQp41ry1mCBCT+EwYzLwlQdSqosHvvccx3LaSHxCpW+dSyIJRxTEKpuj9uNs0cziY9R7jlMkBnFgzZdSUhspAuUqsYez1wnOfWhOmBqjzEaFxoULIzfqQPVUaeZUchwM/b1dx0sQA1Jgzds3KufvYfG9UtYwTmWPgA571/tR2MgNYC5fehVpoNtWKlzrU8BybGXAQZu3OT5sW8OfPbp1cXj7VZ3XtruoM/P55qbtHT86f2J+PTy4fy5P64xW9y0v54SoCP11cvTrUSTgdGne5ODtf1POTs3pi36rnZ4tTuVzYkMvl3w0vXeri6ZOT05N/k4tf/9/FX+RCFlVO69NTuVjYh0IuD26tBdSoKg5DZ2/d4VvW+Uv9WZ+N2q2/ysXZydkP9tZnY2rv+ts7VNwL/cv5xRO18c05Xtnu55159T1I+eU//z5Mjedj+4vKxaN+cf740aWean1ycn725sjKRf3x5OfzYdhOHhvWxzZ2Zwv59T/PDxYP7OtLWejp1d+tg6cLQ/3rf5y3YYztgdUeKO18rcP5VvrKMIDXB+/krJ9fH7m3db9PfhTSmkehn188tg+NrWuXT0+fPHp6Jj/bz0k51WuDcVcW/df/unrrMBpPTvRMF89+xvq4OHv6+Nf/ax/S88UPT+WiDd8apuLZs/fZmOnFxfnFi1loL/x8ovbhXejZourFBJ+UW194f2vVQD0fC3vt7+98+T8/9/7v3Wfus9ve/86+/l+3hhlWfxxm163//v3h3e+O/ttMRzK890iG5yMZbCTDfiRfjmR875GMz0cy2kjG/Ui+HEl875HE5yOJNpI4y5FM+3VyoyO5XyfXNZL7dXJdI7npdfJ53CanT/TiTIYc7strQ3hso/XYOvyLBWb1R3k5PGcvYrh20vXiKl/4yse21y8tlhYbovPH5wv9eShRV0/EHjBEe/K4nMjws5evOFxeOePP46Mh/vr5Kv6aYHhvhzHx3LKthGWp1C8K9z0rTPo8yB4yq/fj/WK84weP97WY+uWIvygg+mLQn+dK//uwV3HVpGd7FS+ybZaE+vVULi9PbMzlKrD8/ctWvFaO8e39kWffevSznA67WE8unuqA+vmveeb6vPPBr3Zh3vu5aY3P/fPw5GE7pckTuVpPDP6LgXr9A/CS/x/uH391tLh3dO/b+/de4v9RPNLQuOZDrsFjcgqVWw+uFxcTNRwKZwSlTD6JtBrYi1MKUTRESNIZmgvvaLdc2Kf8kX1uLp91Fg9sktkLP52cDe8cPg9XFOWsnVhHnmdn2wdhKJz5fM49/9ZQr+hC6/kPZyf/pu3Ri48HxGubhlefV3DD74ArlRqusorgKlsFrjZJ4WrbDfzVq1fnBMHz1Z8DHwhX7wzD3jfEYSPzq8PPj+8c3V08OLx3++ujf7plI/+qwa9dEqFOSmWkHJOrGaiW0LlfT9e78bgN+lGnOa469Mae6NEXR8efHx0/vL/49vD44Z171sz33B69+WPy+uboGj4q712Jddn152uvcm0j/y9P9dETufjBPlqP/nry5MdH5mvYj9YXs/O1u6tYkGqS6j1kLqE5ld7azcd1cA/4HYCPlgBeb+3r96GLLuYhMVCj86Vl+y/WSGF1QWxHsFLfnSPer5fN33WXxH4fwppys56zcO1dJRZs0Wfvxx0XohHHheaI+Zt3Yd4O5FxFas7OA5LNYN+1CLiSxlfPdjBuxfZvszbzdPf+g8X3R3cP/+lP3+2cQabpDPIwoI9Ozh799fzip3J+/tNrFcMoZ/NfhSmmkGpX6kQV81qs8OyYHtFENvjdQMFryMEl7J5iq1iyLctU3CrDi9ExrjS8syP6NU1ndt8NVRORFvZEXaG3js1cqxTjGm3t7Mh+Q1NZ2ndzrUPhFu1hSJDRStFjq8ULjzavNK58wVXU/gbdLw7vDTH5jka7/JFFu7FzL1q0ZYt3sUdNKXC6fvD3bTvr93SXmln+mEJd3wJ0zCSuB6wOo/iIDVZehxEorb6Be3Zsv+aPLM5NWFlrsjg3luCyuOoVVEbGuTjC9s6O8Tf8UQW5jBSjK6HkzqkAhhoAa2mjrTC7cev0khpd3xwe37m3+Pb+8Z27d+/vmA1OH5kNVvNyi3V7OKAMrhpr5yrwWq6Wmhnbo/QxWWAwpN6IEkbDiRWD1p6hrLLAPvEICzwvsl+nj8z+lgodUk/kPbraSKGwEJY12t95Ef4mfVTW1/nGkjUm/2zuUnMeEcdvMdPIFZrfpvyH7w7vLZ5vc3z13dHxVYGMXTLB+SMzweBya0Bdm1Qx8+tyUoelr8UEzxDwUf6o7HCJgL4PSm8qHWOstZd+XRJcGglbA1buPc8R79f5IzPGrRYwN1qAxJN3rXJu0hqt0RjPEPM3+aOyyKFXZ04WU/RCHmLvGSP6ML7q8Th90C85mvqHw+/vHB0v7h5dHdzcJVO8rJ7a9HpvrKwSOjpMgipCAD0op7XsQ8+J59EynhNrvWRdK6lXZEZvzjNT6qH2lfY25oCr49450fx66eycXOcVwdZ8C661KlXFeQ9YwjrN65yofvNOqhMyzRBZCxHm3NnXXNQ3X3odbU3DuAwqvyRb7vDeF8cG6suj43vDmYVdE3mXlbvcangbKKViK3CKZD4UFk0W3vbrdwr/1myq+fE9WsZ3e9GtkAWzqfvEMVMrRcyRwjcutFpaV8zHEbvMs6P79dLZu9WM5mL97d2cKUwdBymQGvGSEvtLrW8cY31nR/mbd1LeUkKzb9mGIUVzljtHTIwpag5r322Ob5M+vnP768PjL64S6h7sYELzsnrGWzXH4lsrFiHBsL/Y1TouaSjpuRZzPD/AR8sAb88e9wY1OVBqKVEqvsdAvsWV1wlFz2H1bvP88H69dP5u0yCb7fW5U9cKBIQpqHDB0NYYDs8P8zfvxLwdyDU1m7RDEfrku2QLlqlUJ+MP/dKo+PjNM8hvYX/7DTtlm8PmbfMwRq+cafQ1O+cwVDaeLE40U1+H7Z03yqNlKNdqha9xdJWaF2jJuknVQwHknjivsrJEKccVVnbeIL9eOifXbG+vsSwdG4BIqGZKraMpdAk55bXZ03kD/eadQDe0xEbITaSQI60RBYgwlB7Hl8sYd3rILclPPz60kV98e3jVt50ylPFjkGkp9mpLLeFwqKSFIV+qOU5ryZOaE86jZTgnVmmzV+JgVhQLU7YIlT0N2cor41RKYeW+8Zxgfr10bk4u0nZ01SctxTGUirkEkuQiru8w7pygfvNOqFOer+asCNBzNBvqGkG3nkrC0ZY0jjsB5JZsNzy4f3x47yvzif54dLx7YSd+DNa0hwQsxaN3zFjMlobhCG5fxz7w3JAeAW7dogpyG+qFATsp0FvtaFEqwMrzPs6tVmLnBvRrwI/BqkKu6otRFa0QKEZ02XPg9e31zg3sN4Dbt6xFQ2PPxbrba+/ejCtJ0zw+Rk2jluGrapNvukzG4x8Xh3e/P9xBw/pRVI+iFFusjIEBqWDV6lpJouswrDMjegTbrx3lhosTtYYgJYFmi3I4Ub9eZmh50cYRdnVmPL+Gj6JyVKqpUtLmrX+x2mz1PWipYX1mdWZcv4GPoG5UZ+2p9mCLbkDIGoVzLn68ZhrjqDX4alPjzWzx+w+OFnfv3DO0D3bNqPLHYFQh+2geUocePFci32oppbl1GNV5AT0C3rpNDc1XKKn73AVbglaTdS2sjFWBRtSmmBfOr4E/BpPqKPYUJISW3XCJccHUBHSNJnVeWL8B3r5FxagchqtJE4TesmdNXplkyh3gTwnrs468YT+XJZbdvXN076G19/D2wzvf33/wW25jfRVuBvKecy2t16glRC619eul2Daxj/vJgwk3gLn33dGHcnEpOGGIuUnWTqXVrE4bb3w/9pMHs0ydvn/v4f3F9wbn8MOoiGcK4Grtjqk4SIoIlcI0O6qfPJolm6dmfo8+EAobBQ8CbZggQqm2HGqKftR13x7nPVuW+AmHX9yxqfLhd3w/f84rf4Ci126NbUiJNPgGKoHruGvZAWe+ri0pMXbXWnjn9uFgc9ZwJftrD3tV24J9LUDgM6taW0Mh+9/14lLvZjZ3U7SkBs2Dwy8Pj+98OK3nz3klCnmfXVaNPTNZPDz86cGFkaBmvgouLyTz+d2jB7cPP5zVyye92mx0lTVgVesH92TRqQtDpswoWmnms2rZ8dcvDr+7qmD1gaSePeaVEx6jy6WHJJyhIuaCCrnEvWcxBtOS0PXo2z8e3/9iHdbq5ZNeuYGxB/UFzDen5NGTi6VyHucGzt25WJZm/+Wduw+P7z9YfH7/wRqAXXvaa9V5KA71WwRsciVzD72qtR/3M2wMtCWh7p3v76zDZD17zCv9ZMjvS6VCDhZsdZdTzQyYx3kXs59cS+LePx59dfjt0b2H99cwtV571iuRumVs9kfxQWrlClhKCw33q+EYYEv0aLM2h/fu3/1wWi8e9Oowg2qKJZC9W4YjnQzRnME0zhnkuaNasoHx4E9riK/+9Foqe2RJChIzud5rjCkYrb2RGgdoyb7F919+OCB7xivzlLpjkA4Zxf6rKIl6orhf7MYAWrJL8X+OPv9wQsNDXlU5xqK5cYzEGHrx0fyHFqXuF7kxIuCyuqh37t49PP7iwzG9eNArnzwycggZQyku5epzS76O3Ked+3Lnl2xO2PA+eHB/DTvqLx70auHrMSIl1CKce8kNJXOO75EK7j/k8verW6M/KWSv7x1NJbEnCU4bZSMVYhDtpNhKW4vEvtNgNiyxc88+ZwqdWjbvLlvEFJ01d3VqNsHKRW6nwWxSYjenIHNx5EtOVXqowQUP6NYnse80ms1I7KVIr65UJm7DXRXdTE6jSOtyCXYayYQSew45a6YyFHarydyBlpjM2x63T2dA501qKxI7dZdqbUTIrjmIXVxu4nkUszBCYt9pZBNK7Bp6qtwbsHJyLQRvAVJ3fb8IjuA0ucIOPiVIHJRB2WeJoaL3Mm5W4cxn1XQSu5RQcyXqvSJVh9U1JQHYT6oxmCaW2DHlUlz3DlVKAfPRiwjxHtYoWFuS2HuxtlenuTWsBTG4HHsqdQ9tDLTJJHavMfvsqVlfcrHGFrNcGds4THN3A7chsXOn2EPywxkNQNTODskm235ijQE2qcQeYhFWC4dBtdj/WjUDlnJYW/7KbrOaQGOHhjJU5uwOUoxObTZlcwbduvTB3QY0gcbuU9DGtdfcMfpeOAVQ6SO3lvzcCU0isnN1GSnGlgGTuebZtWp/5XXlQey2DDipyG4TCDglrb0FjlicR2KuZe88jEE1qchOij5oao29za8USLiFiuNvmwQ37rrJq3D+DWbPruj+tIj56TV2NV+8YOwoJeRgrgObacrg13EH8w5j2bDC7hvUit2h/WOed2s5Qwa38jopjI5XXie1w1g2qa9D6gqSQvGFXA2JQ0vDHbrrK7W9w2A2o65TVxfIudoTgAyVsim5JGtLX91hIFNq6+hbAba2uxxcqQjDveJuZJkBxlmvaFtR1luLBOYWpO4KBQ3QU02JR/vYc55YUx5dJxebVAixOKctAJJkieN2vmnWlKZW1RG5aCzJlj5re7N4tWoHx3tLtRrVdKfWKcfQhnr+0cxV9Sl3HO7pXdvWwg5DmlhQ16oeg8WtoUIJSVIDiljj+jZVd5jVtvR0QEgco7bkmAWUoQZIfb8GrkY2mZoeqWNzGUrp5WrHrkPvXfYTawylLWjpLlfxuRIUStojdptW1v6y9wFX45pUSRekwLnGEFtqqUSN3jrW3doKgu0yqQl09OIqqqAWn9pw3Q9mm0qd93zG8JlARu/OR4XotdEzlZZCdT7lPZ8RfCYR0ak0GM5npibR5lIL0jQq+dFlKmdMaFoNXS3AVc6JbIWTqk5rTako7j3x1aCmVdA5Q3fsqVVOseXcimTQcccHIc571fNL9iS+v3/34dE/rMEyPXvOa/UEtFTAnHKXQpAAex2qC4xOdQjjMh38kuyUw3tfHBuCL4+O79mXn9YdR+C3UFdAa8w+cmXJWrT1TM1aef2I02+tKzALQBvOfqjd1rlSU+/VXIostbkOnvuq7AeDunrBmwWgjeZBcO5U2DfXGMyRyAGHUxQj8yDiiDyIWSDaUEl/kR5TGmLZisQ9udTNa/BrOwwzCzYTJkeY1yBdCUlTdxhTK5FsQo07GYj7BW+baRIZe9IsHq3tYUjQIxRbGNPYYuR7dBMnTJBrDpO1OfUCmKoLINWPFHjB7YltJ3kCYgShhOyKaxVCRcg5tL62Q2jzoDZ1WXkZjrmr654sPBduFQv5kaWPcD/XtizWp1yIFT0+y6+wxjlICOvaIpwHvMlke225ZMo2xTqi56Tka6FU16aOzIPXFgR81ZyLef4wdDCbXbOeWhywtgpx8wA3qZSPqaTIJRm1gkMxZvP+c9E6eld+z2wiUR9jgw7WmYbI0EPJpZWay94HeS9SU1SijzV28ZKyT75ICdyhlJEbV3FPakqhX4GVUtAiGVt2wQ3nFHOMe2fjvVSuSSX/kszP8I1djblUm2FdNIU+uqzfHtnk4n/tgiGpWpvLkChdGwCFAqM1ZaJxkqV7G515PHeO7i6+PTx+eOfep0bOTS8pc+0UuhcLwIJwr6X0SonjOo7Rz4HPhhVldJ2Fiys9+h4xS/Pdt1hWVqynEXeGzoHPJgVlsy4ArrGmzMgMpDmWBry+wvVzILQZPTl7a2xrUALWrF1zd55B49ga2/u5M6mazIFCAq8Ue+0Z2IHNpOZHXrjmGffAtiUm15JqtZAqyXDZjX3le6m1y9rO3M+B3IRasksgEX1HZEWbZKmpuX8j6y7ucW3nFL5WcLVFGbBpbS17Tox1bYcbZwFtsvP4KQV26rCotZ2guG7uOIa1ncefBa2JVf/GEKlJiSF1drFk46Bp7DGtfbS1VdEfiTpwVOsU+OBzClUIG+xt2nuwm67wvXOiZG3T6GIb7pWvMJTA39N6D1pbUPxDDT34VmuFwhxK0sJKYy8s2Ju16QX/6kLzqXaffHVQCrKTHpnXl4A4B2QT6P1k/gaAhkDUGmGMgYAl8X5qvQenCdT+WqBAy419Bw+RfdNUZWQ5tFHHVOYAaqLS+AlRelXMiSqXRFDJQ9+jeh/5cVKtn8WFkKMj15QlBIeugoyMm/fWagtSf5MWcxnu74sg1pXUMbgGunapP75N7vjO7a/t47P4/uju4YM/ffepsYvTi/1VWxvOIxci7zO5wKTiK6/l/PgsCG1Y7neBhCo4EKCaXcWec0ReWT4/eg4ri03Pg9BGBf+UBUKPgC2qr0FYEQLnNQr+s2C0GcnfN6ytN7EnahEfbI2jKpTW5j3Mgs07Rf/ffXv/4f3jb+4/PFqX/P/aE19JJ1JaGirte2PZpWELtVIeeeEsu/0yuMVUABFXi/pczY5Zx5CCT6gR1xdyzYLdhMkAXKBZ+xldKIFA05AOX6Nb3wbhLIhNnQ8QI3sMEJVL6BAxU+4V3TixMu+pTV6gv6OTll0h3z1bDOZLwjayOPWY7d158Jo6JSBoq5SklTBcT8IMElNodb84vh+2LSUFqGr0WNH7HkvinoIvPow8Wr6fdJOnBQTB4AIkctE8EQJM6Biz28dv78VrG4kBDpWwk3ZrqI8Whfmkpe3N2/uRmzY1oPihjGiwENv8yOGcngYL1mgfq70ftAmSA2Ip4tWVnpRrpW59sEmD4za2eE9quvQArIkkSYSK7FrMUBx58rq+sxDzQDVJgkC2VQyaaIuFqTQmqjn3kfvFnvawtpEiEDu14rEYLDJwuXjwErPsXY33YjbtZQBAUIb7jSuwio85NhW5frjvxiQBduMkaHqb3U9ycfL40+JF0ycGWFgcsZirYDGYpybVcac3LmR9OzEgzJzKhpMBtOaAxLlwRFRNkpIDUL8qGcCnMT7fzlLZZAJAc5gThm5Ng6aFBdG8cU9rTADYWS6bEf0BKpjPDRAT1lg1q4IK69r8gZ3lMWWt+MDihtqeqr47Z+2MsTkaWb46hTlj2oqQb03PrA5CtfZa48E609o6ZeGd5TWheC+h55g4AXiHiQkTiG/B79e+VZCm1uutE4qQChap1F1DCpKC6NhqNHNGNZlInyUxm2VyudWrItSeckne7afTSkYTC/ND7eJeggZMibHUnAya/fDIchizRrUlMb4VnwKVWn3n5FtzVXpWkP3kWklsMgHe3IhcVTM47LFk8/c4iOS8tlKru8toC6K7dSaGqOxrLL3n6l0qqcS+n1EraU0qtBukCOaqd1RKjXuyCLhX4j2nlZwm0NbVWlWottCdxU89hZh7rGPPG8yazgR6Otu8saYNJ3piSxTNRa9Qpez3IVbjmURDpyhYLWbyRWsjQaFEOca2tpy93ZX0pj1Zz/YrIHkM3frnMuXmrLm857SS08Sl8zFbgwkDBKnkhJGpCo8/Tz9SlOW3ef0/T+Xs08LF0yvlouZxk5EpLVKNGbm61Gpei1K+q1A2LJQzlcwldxAwh6EIorOoFVeemg/2pNXHRXcVyiZ1cvS9DBUZObscfEGbJrn1JRmrv10n31Usm5HJiw6F8FGTNgqZyceUwthznmPs/67imFAlTy1EDNKicso5DGXwW8Y4NtjBGa9lWxHJg8TkM0TovRkrqLmF7ltZ3wmKXcU1oUaeXfIu5FB7JO2JOpuLPfbm9DkvfFNL5IQ6nIoOgQedyIwTuqa+jNP00pxn03QKeWfqV+GOz6nav8GTotP1KeQ7i2higRwSqbfIlIJ1oTovYPFQqLS+iy53ltS2DqtDqDa1IFjsWqpACw5TG1nRY9ZTazJ5nKMId+uNROwlq1TwrekaL2HZWUZbkMcLNWt/6sUbtYLGK/qYq99PqFWwJlXHvfkRuWLqOQgNperrYLWCru2evp3FNIE43krM6sSBtRXM5xMA7Cp9P4dWwZlAG/fmLqiIVi6Qbcp0daG0Nd7GsbNwprlrPnqLYVMuIoCuS8wcoDVcX+rCzkp4kyrjDUk1N265mZNgc0q0p7aPaVdjmlQYZ/MOXHIC1dzu7GKH2qhiHy2Mp5FlzNMSXPLziV58WsDS9NI4ZM4K2YKjpErJWi5cu+9ruUp+d7Fs+gZ5ha4pcm215pw81hBQqa0sKZ/HZHTvLpZNyuMyFJoJVUJPzNb4AEgUulujPL67YDYjkAcsKYOrKrFUIE4lJAtF49rOPuwukAkl8giBXEZzAJwFPrlaOEpO6kjJ1c+b05ZEcgDonc1Zg+FEEaqW3MrIeTVm03R3gU0ok/teISYDxJWVuwVEQQtwWt8B5d3FNLVSLuh9k+igZG4x47BFJxJhtLg3a1iTieUs5kTUyMPNxj1z94SNPa9vY2GHIU0slyffuSqreRWYAnOTqsEzrW+vbodZbUkwr66HADGG4GtNqVWzXq44XFti1w4jm0wyd+b7ScndplVmZM65io80OqqaNaUtiOYtBIZOGNERFOedxFp6g73NWo1rWtkcO2JtBWoUAmYmTRrcONmc5w1qAuGcPUJ3pVVHV2f9PQhE9XlvnFbjmUA671Qx9lC7XqWxVkyD/Ffz2grq7zCeae5utxY1L9Rcb6y9RGs095GVaPy8I9xp5XM37Br51jhFCS36yuDN64v7lW41qEkF9GCu3RApEUrimCtTwdI1jj9ZDqOU2qvyk28A+6RQBT+9dB4klNxC7MiVJCNAEdeuHyX7rRez7ySQDYvmVTkmL1VrkeHSnQa++gorT5QTpRwP4OYlbSeBbFQuj5JrbQKc7IuoYLEP9x7XJ5fvJJLNCOXJ5VTYnLLQxFEKLTRf+voM/k6imFAib8OVpVlqrZKTVukYndOR97oN93XjLAltRRyP1SyMU2TGkLQgFihQe1ifkreTrKa8H72b8ZGmNYTGzBCjNld49KnkWfKZ/DZ08wW0c2MAdEVKxwqlcFzbwbzdpDSZEt44WXiTYjE/msS5aHGoxLa2kyq7iWdiDTxzEc4+kLTYauwlFep5ZE11P1dTtC31O0ELUEutBJqRY4u+kGt5T+tGWtOVUk/Ru5qpWOiKPnhoJfZG4/hAmCufLUjeUpU6uVihCabqPJecyZV1HUDeTVCTit2lylBbKyaLklrs2qgUiFXWlkWym4wm0LkTp1TUFS0uZCw2fVwLLsB+M+gmMBMo3E1cVDM6reYY2aVuwSv2vr587t0kM4m4XQNqQlvU1NpqDlx2IcXueG3ZprspwU0qa6fuYGhyolxqruIIiJ3nfch6E6JJBW3npKC6ZKtbrhWLBUC+Zw+jBW2kUfqpc0tuhJfH55/WCX7nple1USBm7J6yb4rB/iXpSGu5VXx3qWxY2jYnrVPIqXi2r2KNGqTl6yvb0vPglMLKZW13qWxS3y4UMXavvfQQczRfTWrzdWS1dBqhb+8ulw2VS48qXUpk9KzNsXIu3Wlcl/nfXR7vVLp/9+35k/OLn86f6Lo079ee+Krq0nDSJEMDSYVd75gdMrmRh+7Iz3mJ2875cIzJWp/VVSpQQkngi8/rK6q5u7wmlMHjkBAXwVlLOSbOzUlKo68mcHOmNLUYbu1k61YbEhfJvDuLjXxrWNe2u7DDqCZTxInIeSk9J8YhFVuCcwia9v7FSkYTy+KRsnQt2rofiEXJHELqsl/5VqPakjZOoTM6dk2o+RTE1UjSXNtPrpXEJtPHS+m1ZGu8sQJKMbeYU2xhXcLRDjPagkYOgYbkEu4lxpqDT+apO1sH11UcbYdpTSqUa8PSgGMozWdppMN9iA7SurJVd5jTFGJ5sYbl0skloJaqIEgkkr1dWklnAsU8lORd8R4UNDvvUiqFuOwt0mo6k6jmYbix0rH3NnHMeVBXQy4+0Z7PSplvUuU8Qk/Zi4LLrBqgUTVPPOJ+lVvJaVL5HCRQyTFATBqKB/Y1xujd6I3XOZNasgnx/f27D4/+YQ026dlzXqtNpzn5PmR6i/OZnbIrep3TzWkOadwx8byElo30P35aaSl5+jQHT4U8RDNQEUhrJNetA53Wcnh/Z6lsOM0h9tBi68Xan7qLQpGSAycr74QfdapyZ6lsMs2hRUfMOZL5BQKpIiaoyy4s+u3H+HeWy2bSHHKJpQ9FtsVb49NQ877kRmu7I293eUx4oB+tC4OSR5JiTsKhJ0dZ/djAZ8aUtpLR4LRbI4dz/MKYGXLLHVTa+lLvd5bXhBkNiB6GOw25JjK3wHrns8Pc95RWUpo6oyHklJwLQ3JQL94N29o+5kL7BXA1qskyGirkXHKUCLbwpYKhOIrB712J1Ywmzmho0ATIkxPBgBhCFyWKfX2nKXcX1ZYyGrzLmqA1lzF51WqdFW21r+2Y5e4SmyyjwdpfswNIIfZiE8pLcx5hXN5dnPcKuI2UhgTsmk/acgU256JzbyG1vb1aSWvSlAYLegv0gqjIPfnWdTjAlGkspzmDmiKnIXIeppDFTiVAC4G6Zlv59tNoJZ0JchqEuwVOSA5jLUldwpQdMa4teXWH8UyS1BAx6yAWVcCWUunYeg/B9z2g1arexLfEp+EEoCvVgqbms80nx7x3F0ZwmjSrISIELo1RNZir0KF47BTKaLU8xlG67FU+yxu8/nD/wdHi7p17h8dXgfungy3iFmoDuJSUWuRAqSQy7841LNdVjd8qmu88nA1r51JZSD23SJ04xuK5kJaV2vlQImXlSrfzcDYpoXss5AWMDDeKmkopCWPM65PQdx7PZpR0dFLEF1DzsjMNtQIqpubWlvW481imvES+ZkghSLYWFgD7w2t0ddwpCRhzRHbnaW1FWMfSgyQMrkrOGLCUnl3xcW3B0s5jm1BfB04lk2sJXE/RSJUQK2VYV1nVnWc1tcqerT81OI1Z1YH1BWOoefxVvXtg09XTN+dCa65D3eLanHLujNaZvbMxFtXEkjsn1lJtGbR5YhaMMJUaYm7r0m93H9iWhPfSwauCZ1FM1eJhF7S0SvuZNhbcZPp746KuawdhSolz9hkyuLh3OMai2oIKjyoSDVIsmT0NJdt8I8ptP7/GQptUjK8euzSxtlbR7EJOkrWuT+3dfVwTSPLYxAVoGRAgNNJYXa9+P6fGQ5pAmYfEqdkMstWu58h1KFkZJOPeIxwLaRJ9fsjgS+pQGTgaodZrIea6xzRWRpxUpQfz+gZdMXCweRWwt4LsKu+XvrG4JhHr//zZoME/ldPLW7//5xeli1zNHAkQayk5UK2KuXY/Wrgfd8r9apPmDYJHXxwdf350/PD+4tvD44d37h3906fE8fb52ZOL89NF08X31ukrTe861dvLJK/zHy7OF79b3LYeHx1fi8Yunz5+LBe/XKMLbjnek2a/0t7xyBj9ePWaEfiXp/roiVz8oMborydPfnx09vSx/Wh99Pxj80rNLEocNJnhUynVxVYbVNWbcwDcHvQ7QH95A+hvjx5uiXIjV3HIx6kcXQ5DZW5ob7g6S9fjFOAg880r8hwx37lpPl91439sh3R1mQujDqn1KXShOhSMrjAqO4FHJCfMkfbdVbS3w3q4Brt2LBhLJAQKhOxtBR9trwOPW8eXXJRkRuvu/QeL74/uHv7Tn77bOXNN05vrYWAfnZw9+uv5xU/l/Pyn12x0xhZ6agLSUobiLGoFLfVmGw17tsstNE1sod8NNmZHjqjkVLR25lRqTS76lUl+0aV84PIKuzw7tHdoeqv8brrYzd9yKoKt+JrYdwpCMY5LFIxjbPHsCN+lqS3xu/lS9TmxhMSuOyYlEgrA4/Pcx2VSX8lnb0B+cP/48N5XR3cXfzw63jnbC/gxGV+XkHyOPXbfh3t2uSNxu153+7ca37mh/RLw47G9Q2ddK660NNwUHzOIKvVVtheDCwdhRUg8N7B3AD8my2t9L6kE85MTZImpwaAgBBxned2Yy/xmBvgu4MdjeCOKSyk6tlAISwiZwAWHfULD+2mVz41vG1l/A851njGLlSGFEio1quKBiQUSlU2bz08eUBgBaB01WhNaaCKts8tOtQRPxfpDGzeDnzygeIMrs66zZtUcEizQO0dyddBoOtnC56YxZJ88ohts1jrOmzF7TTn4QlB7BDBPgzKOvZAxrazdvsto+N1oNnXmzDeXKnYa7jj1lSlrqL0FHVcdig4gzphXfjevTR1fklq6r6l50maxt/kRvauOzCQJhHiQacbElp2FeYFsM2diehFwlM0fLwoltZBUo8NxE8yngzBrXDc4fFMcs8DEPWMExNRq6uYLuuHu7pF5WzDzuXaDp7Hp/H3VVJgoDBfJuMq1e5eGyqLjzJo78GHO4G7wQ9adFF56y+JapMGuSbUpFjwIjEwKpwPEOYO6wQFZf86xNR6HzIqmVbib18hcfJORB5liPohpxqyWJRy/DI03d+mZRNchsihX8t5VbVCwjT3gGQ+ynzOzGzYEL3/65cN5DQ95dRhXchiK7JUY0eYWpCKUStFpMo2vUtU+KWKv+/KT7+AqVem9OwHOLfmulOw9dYMZwrsBaKIdXCGOpVTHvQZz3s3JQCh0PeNz3bm9uwFoih1cSeIddlKCDOgaSkVz1XHT+bi7QWizG7hOKlC19niwtqtv7JMBGlcfB7LzBy7OePqkG+BsvBBVo1whYmqDdFUMHENFxyPrr5BfuV+x0+i2sJtbHehQgqUUYOeCtT2KxcPj1BKEAzdnXuBuSonbYEEqTSlb63tzIECtVyHqI/eWUp73JNv2ji73jtl6GSM3SBRr9J5h5CYGZDrIMGd6W9zSdc3bytjUIYar5PEQqFAfW7jvwKU5g5t0p7CZex+ommnDGpKol2ZuSBhZnSqneS+R29kpxCjYHA/EfI1DUo0aN60jdcq5h83+BmF5c7cKFO2uNhasWpRluO3dg/MTHnb8tMD57e0YNsgVQ8glgHbhSF4TgvBmzyt+8ngm2i/02ivnWnNPvgNZaztYx3DThw4/eT5TbBdyJfTKUFtWYQqoVR1jmuLM4CcPaLO7hbW47tFDFbNAGSRhCuwgj3PKUzyIcbZTZwvZnomdFuw5F5ehOl9tImWI4/KZkgVcKxNjdpjXVrd2XasRfC6g5uClguobCbexd0NQPOD5zrQt7OwWruiEEZUVewQSyIl5ZEVSIDiIPFte29rZTUQW/1YnpXlW1wF7CS2O29m1ZdTP2ZxNn1pNLXfuUEodiskqSfYh9DbO+QCGWdPa8j6890WTRomeUIhdG4pySfAjzwmFA6L5srsh6NpMDXtrL7WkDcmMWLVgbCjI0ziP1Cn9Ac3YmG1RM8mqgqVGDLFWjphb0dBxXDXnGPHAz3dnY8os+KauWhxtU6v6TDGGEmvGPnLzPRun+WK6ISxbd3H0jFIhdiAkF1GxJXHmcIy9ysMcDpgvp0kVyIgNzXmvpTqATl3Zd+axt7wBHvB89zm2oz/m4XBqKmKzK5VeyPlEPY68wmOYW2m+a+B2xEeffZMgLVnQVSC7TBY1t5H3efxvSMwHEefL7Abh8fv7dx8e/cMabNez57za38jOOYmuZg3kRZlr5KzjiK28hCDkt2Ed2zj/4yfFKuSPYWtDhrqJxDpUB3KuukCCkbzbk1pBagJv8M+f3Tq5vHyqzy6JqOdteOEXlYtH/eL88aNLPdX65OT87IrV5aX8cJXocrqQi/rjyc/ni7Pzxclj+62PdfH0bCG//uf5weKBfX0pCz29+vui2RfWkl//47ydL64eWO2B0s4Pbq2Bx6j6ZkPvrKeX+rM+G51bJ2f93N7zbODs5b8t0QWHD/DzEXlZw8zG76dH5ZcX5bvfHJYLvXz6WM+GYXlyIbqov/5XO/nh/O+s34u/XJz/5fxMh3F5/u2huU/PZNFP6o+y+PX/OzupsviXp/Zj5ydn1X7nwh7189CfxS+Lc3vgwuaLHCyO1T7TsjiVxbN2NWnTjuWtQ7x1fTz/KhdnJ2c/XB/SZTlTzyvH3VhY/tkjruUo7WHcAIN/A4xnjvF1GF8c3rtzdPcmEn4/LW4kkX4LCXqbxDeHx3fuLb69f2yRxf1lHGjP4SYO+bdw4Lc5/OG7w3uL5wW3vzKn5so7egsG72HcBMOW799AY4mxOLz3xbG18cuj43v25fIFam8qbmbhfwuL+P+z9zbLcSRJmuCrYHP3MCPSjTI1NTVTq5Y5IJlgNbJAogdk5lTWTAlF7a8S0ySQC4A5Uz2yDzPHOfRhpQ8rssfNF1v1AEkARADhBD08ALiTLCQqIuBws89Nf0w/+/QmFod7z/5x5/C7hQz9qw8y9DfAcNfAuGhH9ub85Fy/vjs6eyfn+efPkVi8243hbRfpnnWIfJrVfHKsk3em865f/6F7S+F5f3709uhf5PS3/7n1i+hUZ3mb37+V08Wcn408v3vQywMsp2Ge1l9OTs81g/09+GgvDsR9GM3iVat/3LbDq3P6+EL1G+IUXx2cP8I5+Jx1/9Vz8GHpfbJ3ulTa26N8/vlEdMvu5JMdOz+qatiOT94lNYBb5ejs/Oj4XBedXuS0fjKKf7swdIuZ0uueaUotV63h37bkXVos1YvrLJbhaWfrjn77t+Nxp20decjnxzuW2LRFWv1lhk3X+tbb3/71uMrtNu76lOcThU6nVTHOR7Luef3mmb13kndpyT4dprlqyMh73I7u6jx2JvCNvD2vp8fSHfG47qEPrz+JW0fHRV3u8YWJ1+e21dPFaYLtrSu+XJ9E9bSd935fz86777op/kXe/kP3+uXvks6LfJzktc/qt/ee1Dvo4R/l2NVxdNtlH7aDfg+0bR67obQDG8on+aDZZQ8a3udBs7cc4fn0hNHVB8w++ufLwhyMXK2RTnYO3Gxn7jVJ33x774xyxanOTyZHg4UrNsf7x290/Bz9r2XaBt5u/fDuP4s+Mo/ewIXZyFue5wDtemzPRfL769kiFb6xv/ruRC1Ll/xe7IrWs6y/7KTbJn37cRv1ZhK8patUuh86e3+2ld+fdK7xMmv+uP93Wuu7X97Kvyz2VTv/uZjHD9Zr3TP3zbfuHt7v4krnF8mw9xzdNlyU5s/e6G1rkB0jPf7czcxx5Q1exxTnwNHAc9BOTt+9fytvukX+9vzN+2P5VX9O0tt6bSr21bT89m+Ljy4KO4tw5+JndIRbx+/f/fa/NAA92frrezkt3UudCTq++JzOWD09PTn9aGb0jV+P6un5oraT6+nI7JVvvrtRWbg5aR/mRd/7D8+Af/ftgkCUJf/c2Zlv/vcfd/Z/2P3fdCa763S/+oL085GKuOQm8ls5OztS+yyL5+z3nwzZlf5/NzlGFy+9+VXedvSv89P3tcPuw6+52P6/9cKXTKYvve5ij2wd17Xrua5d0/0usvl1XHdNuC3i8XVcN6zpurye6+KanjOzpudh4dnWcN2Ftxjqun/prtwFhUXOZWEi1VR/NHgLc/3JUD/bOdx5tvPqk4n+WSx5/RgmlxI616B4K8ImW/Deqr3J1KxDEyjlGJJ3xUo1xFKok4izwuQr8y33KqeaSb9RY352MUDadtvdG/98dFw+bB8tLLAclyO9+Q8b/l2bsr/7WHT68Ap19ZZ88tfjo3+p5c1Hw47XiLILFwKLc7IA8RudlssrX3iBC2EGV0M1tbkWIJrSiqSUseT+Ely2n8YT3uTsXnTWfbXz8s8HL3dfv97rTd+9FcGrlN0BUPzMaf+hnnXP5m39dL9bclJy8N7m9b//8vYoH52/WQRGVw4zEBW9bwPUKmPjUDJGXCHo72boLqD7wxLout7lH0W61o4fYCVTUe/fhZBqhhr0u8wrBf+N/lnFl58AgN8vA3Ah4LX7cvhm5beAWL1LmDGTS0wBqrGlifM9O7tSH6Gvp4/ki2VWtLvfVx1P49l1wa+1wNhqophKYgk+ee+5sas5SG+X6HrKHi45xvLdzsuftn549Wzn9e4ffnj0DtFvziGSBQbO0qqtMWhQ41mgND+IQ3zqwP3Bb9gdcmw15pB1MJEz5+hjzejSSndIfdzhU4fve/8AnKGPISJlAHYmZCANZkwiCQM6w6eO4wu/aVcYnCPk6HQ9Br0YWp/AYg1jZIdy/Nf69qEj+OkmrwH37ZLD0cP2bzO+EAJQ1XjTh1Z1BiHUuq507zFjgXdgMYD0coMcYmoNLbSMxkGNHMGtL3N7zFi42xzTADLLJnpbg6McfE0tttxsJRfrerOvx4zGMmWvr9dUBmNZMDbx4rnGaKqnbLFnf6HprYklOl3r0k+OztWoEbXLudSqqyPVmqmn3LWfoL1aJsewdq1knytQTFaMKY7BF28ySuCeUkLTQ2mJNNe6dJFd7pwKUfXO2K4FqDRNTaWnkuT0oFkmhbxOCWSHLaEmm9hEx9aKYkRCDmfncws+S6SB1iMJVEqzhVqwRoeApkJiZ1PPsGCKK2dJDrn74p8OD74bwvF8utLllpvl5r00VkwQHTejQ6vezvjcgs+SvHIM5emst21bLU4y5RZdDtCauBmn23BaknOuR2Va7xtFqKUiVsjbWBpXL6WnJvgEoVmSgK5bUrolQ2gJsm+YEaIQmHwh0DYvn2UYLdmDVs+x8/Jg/+sB+nihyyDBmJAxRAKr6LiCNvqmvmheQrfBs2T3YGh1byjJmEa5WB+jjiHUGhqmMC+ZWzBZsmswtJS3Mx5twJhz0BuMmBph4cbzQrkNlCWbBMPrdieLBVxwKbusYwGTGrqa3bx1c1uhbMn+wPpEupNkQDYI1WeBhMaVUGrt2U9igugsEw5enyA31YLINTdoHrptNSPFfAHvCv3X0Hde/vTQUfp0k+MWm8kbdEmkJmnsst611fsWXiOV6tFiseZic7Y+xVJzxmSzN4UcJyutrpMX9WixWGexOTtprnlHHExzHlsxRUrya2c3PVo01lNs9slg07vT++UcNDNpCZIEGCw3eWIojFhs9kicitFVgrUEtVx6v1Xzxp4pygTB2Ui1OVXjIaRUg46mWI7JYTbZ911Bk0NpxGpzrMaoc6EEHNS7OM4lGtszy7fTg2bsanMRRzqGmBLELLXGRtmEHGZ8bsFntGpztAg6FqhFwwK9b4klN0c9nQ9ND5mRq80++uACOq8AiddAoRJCX54GTNDrbKrcrN5GSFyIpWEsphEkIiaZF9ItOI1WbhZbigfjJZccsIpnV3L00Nf5TA+aDZSbfeBiMwUJCg9nZ9TO5RZ7RggTXD6jlpt1FWicAJAAWuWWgRCj99jXuE0PnhHKzbzY2KQYU+QagVJlg8bg7HFuwWSEcrMETEBqxjIWtg5KAypY7Byu3QbKKOVmxGDEZs04bTJNnI6OdVS1n3eZYAI6brmZ0EnIUCt2fiU4MGw105m3B25DZ5Ry818+qmldUcGyhcBEwhZMDb6IL8aGz0rP9+9X+8RoAaN0qb1k1HAtUdh30VmtECIbkBIGQuZpraBn4XZg1lXmyRAbxsaiiQ5zd2CNTDRtBmgpQMt2qD8itM6d6sSVQ44lWWzex6xfao49ibXTQ2lEAycWXEbPyfjuLiW7BH7ZsfUZGb0le0cr+7WECg+uVfpKPFZLyzx2RfKeU7AkepnIyJcsnsEbztzVXnf/Y4eHs6PjT11jFo0b3spihIt2DzorHzvOLBrqnixaPdxoovupR8Txef3UUFcn7qL7zBgz1auNWlzaXP26GNX1JjMXv/txN/V5lNP80Bt1fd2k3q8913URkBXtuS4ELj+258JFe66lHQZueKE1tBf4aOaHFyb/OMGjSJPv7R4q4jdbSfzjzsudGwrljq1toQAVV7EiBaMRmMFYDYtvohGkj4ZDZZuQ0JrY6VUY4wAkZVzQI4dUKLdsP5coB+alIuXglqiUm+6GwNjFV7/4GhZfeaFe7hZfafF18e4iPge7eMV2Dy7g4gqIt+qcs6sWyIcMGDQubQkoaqDa/3CB3kYvRvtiLJ9F3Lv7r37a+mnn5bPdl68/C7y/WSD8cudC0e/lwU2T0OvBuBqMD/BwfN6tZCE62Gu7YSx91xogOM2YHDbnTadJCBLa9W2Hm4cS7AzhdQifh7uVXi8OLawdTcMkLjdAC1xyhJBLNrXJqnMNBGF1wW9CcO6FO5RfL449jCYAmyIlb9lD9si2EcXqQq2x3xEJ7nFEYkLA7oeNq6IDV3ahQS6CIRRDjXI1pb8DNbGf9bU3Uf1x79nrg8O9lwdbr3Z+2v3uKflQ3pwPZY7CjoCyaGBUHCUx3voyiA+dFIrP+UG4USES5uJrCq2kJNbVqsNyq9xooNjDjU4K0T1+OJ7UJzYVaulMb2I04DpddRrSk04K233etDN10WPr+Abek7NNKvmWMvfvumVDPyvsb+L6/Q/7ewdbhwffX8zMU/GjcYPNt5xpFZgNloKtxMwaF2WMg/jRySD4PD4IH6qxEBebKrVsurN2XUM8XaorU1EA61f70MmguRcfjv/MptasX3xBhGw0MYVQMfbsy+X6+M/J4LofN+07c2VGzVWq5FAsGB0se8L+PUm4n0zMYgv6M0wPd57v7O5v7X27c7jwK0/Gey4/OTtSGhptQbERQnQl1q55BljAYbZyJwTi82UgbsKDusSuJb84mhZEdFAtV/GrPCjGgKs96IQA3VsK6IacKBTXvA3FR+nku7tto0CRB2xuOSVo95ca3FH9aDU6iFKSiKTic5Ooo3P4BZ2fe+7n8pJd+hcvftr/4c9bh3s/Pq0sdJnCwVh+1EB2rnV8UuDoULABt3hdYf/efnRCID5fBuIG/ChhTi1xjtkGjtBsDTZUWrmbayP3yEQnBOjeUkA35EdDcIyRXbLJmMre6Xq1IWA/Pxr6+NEJQbu/1OCO6ketzbooM5iYGjcyKZni23VA7/Sjvt9e7oIA9Xl4dPAnhWDrcOfFwdNyo3ZzbtSx19/YfHXddxYlEpNvg1RFJ4Th82UYbsCLcs0hCDvA7KhY17LpdGzzai8KvPp4zXTw3FuK54acaM2mSE0pxJJJg91qXCHFeDgnOiFk95da21F9KJaO/kdQFkQUS15CAMrc24fGntLfS/bpD/f0ke2Ue/78pDwobs6DJiFAtCI5c0jFhxBjhNAG8aBTQfD5MgQ34D9Lc0468nzmEqUln2KymNJKTpGFHgoWU0FzbymaG/KexnAzyGKyMSm0nDJEogTD8Ykmg+v+Ujs7qu+MrdYSCwtlRI2FsoQkElxv3xmgn+Vdsq3w3e63B4c7Wz8ulG8OD3b3n5QLdRvcy7UghOSas9V22ieAAlAHqYlODcjny4DcRCYaiRNCisYndaOp1IIulrayLoourPakEwN1D9zDcajWBuuMNSGKoESplkBylX4O1fdxqBODd3+p8R2XZ8RNXWv2UjinWK1aY4vxC3JS6reva5fsNPz0w/7un/a2Xh+82Hm196R8Km3Op2ry4jIZIA2YfGBpIozZ+SF86pRAfL4MxA34U0RqCVpKwUcP0NTyelt4ZWbqgFafdpkSoHtLAd0UzwiLYCy15mZEzS2T5jbOleG2dqcE7f5SgzuqH5XqHLnoQ6ComSl5qN4X9v39qOlngpdInf3j3v6zvZ2tb/d3Xj47eFJ+1G/Oj1LMUcPd0nRwOlgbwLAHxkH86IRAfL4MxA340aYLs2jSEpGdBJMJpTKgW52X9lDAnxKge0sB3ZAfJVeTi0KlIPtcCgUKtdiePCPbx49OCNr9pQZ3VD8aWmnkfSILyCwmFA+YKPY/99JvnxeXqGroEH/4/mkdeNmgdlFjjOibs60VYrBidXzR0hAOdBLoPYeHIVsE1qREOTT0JllukHxyTVa2Y4bQ46TLJJDcgwekWBSBKDcksMWHBKXogBz1dZl9zolOAtN92LhYkUdGa0mqsQJsEqm5DVn610Q997O2Szo77L3Y3f/uafnKDWoUhe5gUnBMxuVYo3OQULgO4yungN5zeBjaRNiy17XokojJoZN/V+Nar4tNLd+t5dU83EkguQcPSJMIOmE/MlyD8YRcM5F0ZyCG26adBKb7sHEtIsiYWkyhkQS22XIVDjH2P7+C/YRxFxXdz/B83iksb32vsL58YvTbDcoRcSLbnXEwGGy0Bmoy1pbrKnD35g5NCMTn8DAUiSJ4aja5gMyhFFRcM3rhlSdYqE/jxQkBugcPSJQoCbjUiiYnpSQ2ELFKJZQBj7BMCNp92LguETUs4EttNkDXCamGStaGWdNvNaiL27/ZD3IZpBeW99XWzrPXez8evPr9fbo9XSaXkDhz0aUoAmg7gldrjuws3PclMC2VMvmI08JFvvoqlDTfj5AzldAJljQfoeQkhWZFvi+D6VYRhAvP91UY5egTU3LSatZ7xGrFxFLaUK1uJwTTkgMl6+rdGZyLbDqeK7nSUmpsLDQovVDrE11OCLYlfOW9F/90cPh657uDr0fu8lJX0oKcra/S6U6AeCHnfSkh9evJPq+5q+AtIcm92nm+c7j39ch9uM4lbEERM07Uh9Xu1sEhks2uH2w0o3aJ2lIO3Pp66EYmyWSxpgopULaSq/VMvZCbI5ErwC3Z89x98U+HB9/tvvp64D5d6ZJvQYVaTJkXKiDWGgzGcIV+S252c1ehW5KTPd/bf3148Grr24NXA8B37WpXDrlmqVB9NdZGcQ4lZKCEc3z5pQjaJdna3o97Q5jMi8tcnmFNucOIqqFmNHkzIXNs0M9e4ozZFcyWpG7/tNudpdf0bYA1d+Val7lBQc8WdXRVHAWIztQaop3R+2L0lsjrqIfSUex/PXQfL3QpX2YQgK1xGH2MlEV0kOikF25uxu0Kbksy8Vf/cYCM4D9e8Wu6xkpJLhkXMKUimtW1SGXOBr4YrSUJ+I/Pvx4tvcblFr/3Xu/Mec280ZaadKlJkzYHkl8O15KU+z/tfvv1eHUXuSyyWZOCz76kmozm25aihpDXu8TOgPUCDJdp0S+kB777etA+XugydpToE3RBfy7ZBQ/VOgfEc/TxxbgtiR11rl+9OhhgQ/njha7QNcnX0pwUtoGEs9dErVGaibd3QXd559ex47UXQHPzBQpXFFbcMjRn4LPNyJldexdEcb21zxCDYlQDlWZtBM2ha8im5Zk12xuh25uoDFD3RG6WUu3YzJaL861hrpLjUPH7RCCyt9U8f/fi4PXB4R8PXu8OVf28csVLFCNqjGGyUGEfxaHPVRee7YuimXG8tXa93iIoZ0utBB0hatTXbLiI9XvvC8/A3Vq9XlcBFKv16GqMHam1SgimtOKu64HMkK2GjMatfgrbZmoUq4mYh1jVSAbjYu0H2+zpPqAWxi195mxdMc7kVEqpEIorjNbZvgyfGbXbCtZjVD05YfGdtG8uLVRbnSnZuOvR/+1xyZwA3F6zXk/FE3LoeCGmmFqAa0uhCF1od/bAC+bldnuJet3lTmdCdoQhg2cWMpWLL8XDUGWziSAHY5Y6KUVsYINzUE1LrkVdfy70Tr5n0G6tTw9d5ySTC0d1YqZBsVVK4Wqp1MEKMROBCtdf5AxQdRF1+vOaUJtsmEPg0nheVV8GlRujwGl8Ixec8RAYHASpjbP1/ThWjmewbq9Gv/rjTwPYQL3IZYwRgTo5cYcVIgqaVLxHZ/olY3YG6wNYS3jff9z96dXrg5cD7BJ/utIlbCK+pIZkbBG2JUfpOI39sjA3G8SPsC3Z+jjY2x8Itk9XutLHMzXDhN0eo2dPpeTi0dvZj30ZbDwm78OVjt+dyZQkxbecowaOiGYo3sdEMIvLOB+7Q3E+dj/jfADVrAPT2J4rFEXBgMco4zWgeozYXd75yJwPhci1EpprZKL+NRpZuHR9iQ3fWuopQbRmzkdH3W6RsYZEMdhAXKM479bcJ+opIbRezgcGstRCDE0xMlIN6P+lnjVnN0O0gvMx/Dl3wVJj0sg9J9QgUIN30/EE+vO2Z8w2xO+wmnYRxhAWcWAOoIMqRlzfqvMM3Oj8johWHChIuesCXWwKmFGiGaqSMhHERqZ3NDYuC0XriyBWFhuEJA4mSzAR1Eamd4RkXPVSggSdYfEUs36X/FD0jomgtiF6h4YhETRl5hokxVZKdj57gKHoHRNBbzR6h/M+5yhVwxCiWjJFF7NP/Q5rxnm1bY7d0RE6PDQfMVmEYm1JyQj228LnGblNsDsauwbRV+djLgVicS5U6Zu04QzaeOwO3xJap2uqE/nH1kLLVH3AOQz5IqRGIHdkbEwerRUsIUUPhShbojmf/jKoRiF3JCyOwIBPGiNyjs5oIm2RewqOzWDdzhcYntxRSo0ZsJNhNEwZSvSeRfy8sr4MrDAuuSMmcdHr6LxvZLKjZk3SUfUrOM+w3cESWCe5g0xyVaJLroScUHKXR1OWwcgdE4Etjknu4GyaK9LIQdakCjsMU4P+XdkA+rWaMUva7O3uv/rpMUL38b5HZglkrGLYucKM4HQozoIJMIw0/pOHZ80MgVhEqNoSyUZMmur6JGRoJUOAIPSQDHvy6KyVHeCLMVI4W0exiTRXPfrSky1KMzzjMgM6u5Zzc4GlFW6x1hAi9qwv91LAf/pw3UUKeDUgK+DKfi5JySYQ++LBieTuJENokvvSRGfYRqUEQOtOngf0qTryDI30XzQwWLQ+AbhG5gP41gJaytmyJKtmshGRLXYwwe2nj9iSbafvdn7YPfx6uC4uc4VxE2LNibAGShp8FE8pNZ+H2n6fAFYj8zbYeiOdMqkxrRmC1BxDheHkLZ8+YhvibFhTJSPZQKFEAU9CWYDLcIqyTx+60QgbCWtqVIxtUTMyNMDUiRaVOe7oDdYm2BoeARLbVmpR24jkrQEo/WVvZthGpmqUXA15SJKzj7rkOHrCktMMWH/ARqBpxGxKx8fm1pgFrAhaF3vy18KM0jgUjVRFQFrBakIs3QFYNq5Bz+NFfoZpLHoG2KIDMBYUHUcdkcaTb8YMpxo7AaRGEd7wXLoWOMgQrEspiEuludCvDUSY48ANiG6kbJOOwPtkDIJIcqVprpwGE92YAGQjC24Yy6LGMLClwAYDizSqqSeVZo4CRxfbSCU5n53H4CplHaNJDaHWed+wN15xzOYq4IxjTiYW56H7rqujWINfwJ8x/Qga9iZwP+49e31wuPfyYOvVzk+73z1GDD8N4csIG8N0WgnZ1cLNiXVNQu72pCjZOgifZnJwLWNwDEmwqdm7YqvTf9wMsCk+IV+nyS+PFWMPBsf04II1Em6odX0uY7Q+gHgEEzNTlDKYF5seXDgeASd25RQXwDoxpdUYk5UGDMMRcKYHnxtbpYNS8hYCkC0UNdUGiYwp576SDzOIvfgea6Pn+IrdCdmoWVssWMCVVGvqqf0QZvj6kT/WSdfpAhZqbLlaDS4Lk8lQQ0/R5hm/XoSQ9ZB3un60mX3UO2QIpdSqNx16JuEwR5v9qCHrJPPYmqNoap2yesHUvBVH1drBBI8miGDcDLkn+tjAN5SSoghUAu9ADepgBdLJIbmMPrIerk/Axl5yDE0xRPapSNBR5MHayk0QPBif+6NpA7tYGCwBJNcMuNrJFAzHr5sejHZMLhAi29ayC5GiF+ZSyVMIZjjO3fQAxPVzg/QDIaJ6vtogF+GCBg1TG0ohaYKoufVzhWzwlWJsWGPVhYadALuH3LP9i51h68dIGZ47VE2QREZSqRn1rxgbbcumt+zEjNyGdF6qsaGmXEuxwYSul6pBD67fkgvzkjvYvOYLdWPI0fgWgzcRbMjd8VGYIbw/hCPrv4RQowslpVaiZXat04LJkOaKw/0hHFcLxnONjRw1Te+K0dS9SsjV9dU2m/H7HD80Y3KRBFvoZBOKpglFakmVBXO0vblIPvTrKEM3cTw8+JPO+GOE7/LOR5bz4dY1gTfCPpQYMGiW3umdySBNfyYB0ZolfULT5ZNZknG5sJGi96tRJq9iHNnYRwh8EgitVdYnNJ+IiDXVrt4zGx8xxtrvVA7YGaLRpX2c9xobZmsziIugSRtVxlz67mjNkG2o54/rOGBYTIg1SSTvcnSar8lwwt/TAG5EgR+23qKB5iFgtjomLOhzz9M6fkZsMxo/kl13q8XH4pgch24I+mJP1GbQNiEdU4ptidU8gjOWsiIXc6oJhuIoTAS1DcnHuFgd52w7VUjk2JEnIzKFoWS1JoLeaAoy1YuRZoAkRLRA2QeMwaWhhJqmgdcmRGQ4hUw+cLYxu6B3noOmykEGa0M4DeRG1ZFxhh1SdZqrdY2prSTOXpffvNq+CLMRpGSM5tO+ptpMJpNMpdSoVcQZqS9CagQ5mVCsWE+il6dsM6YUEwdT5tTsi5AaR1EmgyliMWUHjVNuIF2LyNa3weAM1ohEEEFGG32mklulFmxM1vmQBtOgnghYI5M/JBkTKKvnKtHWXG10XCXH4fo0TQO2kQkf3enuJBayQgeBrDWuGZQ2XMOfacA2Kskj+5yw072IJWJlsvq3RdvmKPFLMBuX2IEG1KmBgMVOtB9aNtwM197EDoZ+rAG/BLu91ztbXSr/50eJn979BpRlLFLEyIDoQAJoUOK70osZhNoxEZDWrSejIWIstTTCVh2CDQqRC6au1JOx0MMKTgWkdarIQEwaYEQJATCSs9UIp9C3Ma6bQdqAdgxzi6GLKYwNwarHagCRUn+d8Bm1jUnGdLx7UVsYauHYAhJz7Y7u9gsNcYZuE0Ixojg58Si+a6qgN5uFW+3Zdgv8DNqm5GGyMSTBsAYdmpM1tDoEcC4Plz1PBbjRdGFYg8VSoWCiGoFdKdAJ25WhyDlTAWxkMRgoAciTTa0mjN6K/hy5niLIPC+0TUvABDY5J+sjtZIxa1bdkeQSDUYbmAh+4wm/eN+yqc5pQNLRGIMXzJUEB1MMmQxkG5B7qRryB5aaixVC12IJplMz6Jd2z/ZyQyIvOdVs0BuwyVbOxjuvgyDuexpmhm1EaReHCYDIqD8L0VZI0SY2dThy/lSwGkHQpZRoXA22NOxUXUpMibu+rr11QWawxpRxyT6lJFwzua4VqA6OQFrrSee2c/AxMmenkagF9DEFzkHHQ2w8YglzuPGlcI3M2mHAjrNTIoDNITW9dZeKLYPpfUwGuJF5O775VNhR0hiETaGsUWJ0zQ53CncqwI0rzwLFZ2L9Eh3pUKozkgTdYMydiaA2LnfHgXWRxdgaktWEWiNHk4INvbk71K8/1OJZ/Ay9f9zbf7a382rr2/2dl88OHiOCH0awAXWWDEnXWhOn9+2x2qirLtthmkNNDKs1y7QYiAujGDqRaVOlq15XkLiKyIN9crOJQbVWvZZcfCtINoTSQrXOhWiM9OQX9NBrmRpWIwq3GNuka4Edk9PV5oWDMWRy/4MVM3iblnAp0dkGBYRKaFglGFegbxXUzwBuUMolp0IttGwo+BS9L55rtRz6no+ZoduopkuNutYYMjawlFPXXC9i5jZMI6ipgefHYvsQ5MDSJQEROTKHkNCVnh30NBKdgduoKI/eXSN2RnSltWoEqBNzxzr7u/vBtyF1ntKay7VKkWZQM4eIoGPDOJQ6z9RgHE2mR8Qmb0IJVgeif5FqTMHLDNy9gNuIXg+Q94SFbXGIjAElckyD6fVMDcJRhXs0Y3eGObOTAAZyK7aY2LOjAs7gbUDBx3OuNlTJhmMrDZJxJmjwMpvM+0E2gpRPRK9JeakuggXnIOqqSzWEoTrdTw2yUTR9rASprniL1KJpOiIPNl8XWb37PL3vVecxYUlFdef5zu7+1t63O4eHj1MSYTGADVTkbGEfJWGJNgXHerfCLIGGqMhNCql1t03IGj34jAmMmsLiU8uS5Hrv5aUxRwyrN00mBdRaq3G2hlyBk08adtjm1HMhl567kn0abk0KqTFrcZ59xwTCkKyYlANWn0ypw9XipgXd6JU40aGI0SAEpaOTk0BRT9az0STMS29zhTgdAQtCKRWhK3+7VsjXnkJ1NAO30TJcYWkFNCCpGaqpFihoVEJpBu8+4I1XhrOQbXd6m2P2pvlg9JVS+/YMmlHbYA0u+lIjGaaILQRvQrRcU19PF+Y19yBKcClEE0IpXCrXYJsEKdn03OMCmkHcTAEuNFdjbKx/MhhriR1aoTxYz65J4baJ+ltJWY0nAjByampKNXSxksJgDXknBeCo1bcmVm0kFiiIOVUp3njPxc/B5n2gG6H2ZqvYmn2mSlZa4qqLL1czZwf3AmyEylsJhSFm8bZW3x0iRl9NkDDvotwLsVEKb6goYWipptg67bvohQIYGUwXaFqY8ZjHT7vAn8mZZrBK17uLc7OZy1B8kmlBF8c8gxpRwKt9zJyMI8GWGwdbTe96N8Z+VVS+CeHuC32Sfvjz1uHejxcF/8cG4YcBbKDgrfm25ey69mtRmo+hJg/BpkEK3pOCas0V744CFItBEq8Jt885x+hLK6sq3jbyalXQaSG11pI3iYtorU/B5UhdU8PEgcUMVvKeFlS31rx/9+Lg9cHhHw9e7w5V/b5yxcsEoBaI4kizNk/euEKBiLA3gWHGc9OFcB1Hyda31h1FFUDvjbE5+aH6Zk8MvxEL4abZECpylahxCWYL+l10bbak90Ju5Eq4lFIpxIbeVoXOYPFWOMBAOuYTA2/kmqouNMgSA9SIrhTT9Qbzzbu+DUln9B5CTdVEtZfeUDUxGrJU2GOTvsELzShuqKiKUh1JcZBjzrUFNj4hQr8Uws24bb6oampskJuAK428c5lSFQhxRvBeCI5aVY0GMDgHqRoCKV0RwcaU2ozdvbAboazK2QbxOvXdqsOo4wCCxjSnePdCbIS6qgEjkmJ2LC3loFm5NEoBh+qWMzHERqmrSrEtB8c+pdgdKhCTS86tX07Qp5/pxEAbRfjco+TUnA8x6O2F6sWhQjcc42RamI2sfh4ipGQDI0VvLXR8WGGX/XBUhmnBN7IGOkHOPkljI8zNk69UQkaZvdy90BtVCD3lUk3U6KQxi5BYiNahGUwIfVrYjSuHnkPVlI2Nt5nI5gTZl1gi9ZdegF78BoSbGCo8P3z/KGlEl3c+MgUFNPhHR65rF1HFxySVar6+1O5LQZkGRGumnqQowiU1jIm8ra1h4hJlpdiCDT3EFqaB0FopJ8aCSARM4GrWu9ZZj8FHGkrzfCIQjSivgDlmjSp0KTVCKTVZ1NXVs80K9QjsJwLZ6GyS1DHJLbG6rJaoOsWt+NBT8G4GbhM0kuZiBWu7yqdFzqEkEE91sC2QiSA2Mn2EugOJIqZljQR908HlWFtJA9FHJgLayLSRYn2qGCRU6fTokY3NwYAbasNjIqhtii4iur40wncdTyRXXW/6X4hpKL7dRNAbjSZSXUuJO91kqSYmS81n5wPNq+1L8NoEPURzaEWNOIh1ntVGQtHopCc3EuYociO8ENP1Uy/q12yyrhhKPmDMhYfaEZ4IZmPwQYqEzKUErOKqZGdD1SVm+jZTn5EaiwfSskmIJlMrJRcsGbkYIB5MPmYiUI1CAKkQoonB1YaI3oQUCcX19Fp29lobqWOirSlk410LbKuOrdt1xBZmr/UlmI1bv0zGxuI8WA0wClZ2YD273P8oPYV+LYLpJnY//bC/+6e9rdcHL3Ze7T1GCC8GsIluzqFm8pysptAlVVHI2JUS7SDdnCcF1ZrrmVWghkLRJQlUunxKcobrQN3SzLlHn8tJIbXWuibmCMAQPcXonJWIpjkvcbDWUNOCasT6ZrOm1ZpdkCYd8ZRDxtQgDlYmmxh0o9c5LYuUCDXHmC1b3yCb6mNvOdYZwM3pxyebiw1AkD0BFLQcxaLMVvNeyI1c93QpJUQrxhd1f5FcBXG2p6YnzOHJZgug3kaO1VabCoQafM2o+HEeaudxYuhtqBCKwQVjNGSJQUeneUIt3lCyg7VInBaK44mRZ0k+G0jsqqLnyAJVjj3FyGfX9wAqowm9jgiKNECT2Ddfcmq538HQOTvfaIE0YBOKNiTMxrQsmjK0lBsOdQx7YtiNUChN4hxxakbvvVRI2SIWosEYJBNDbISCKShg0TmxDRoV4JawNFuor6TPDNkmTs4zp0QxVAmFckqVWUhqv2aKAPN22EaOzotjb5ETm2i9lcw2c40tDVbunhhoI5+d1zgkJ8oB2VeIYGMq3f+T2VLeD76Rz86njv5vNZyMRsMScoE77ZHWk203xya9SSdDcU6uHL+OviMIYTOIUqGF2tDEngJaOCO3CerJX/6uY5S8l7dn3/z+P38i52EI0WLMEbvajyicpXgYmoZillCIdvdf/bT1087LZ7svXz9GOJ/9cHBR/b6O5ndLnOD+yV9PT7Z+t/Vs5/D17uG1XbGz9+/eyenfrqGq4eBSWI+KTq9+4o1i8/Pivfrff3l7lI/O3+STUq/GNQXEFzCphqKjyyLBF4p301RwhvI6lH+4A8oXu693tj4wVi4IK2tHtWpiaG3WUdnCvpkcIzcPtJLTYlx024Ar1Eqmg+v3d+G6YLbsvvxAbtlaXGLr/1g7uEacM4zRZwGT0TGSjZZuVuPzyfvj888TSH9l6Xafkmkv3Bd32eDFj1yM6tX616x6V0ktZxdtV+fNOXj0nns7WN/Twdqb4P649+z1weHey4OtVzs/7X73lHwsb97HmlQa2SAshhMabmTYxih3+1iY0bzpZvlBuVnw7L01JWaTQkglZPGAgKvcrPMeYJt5hZudFLTf88PztJZ1OK2GVlN3AroVvQRlV/p5Wu7jaSeF8Qt+KM6WIHDSVNa3JEW6vVzOpVyXAbnb2fazzv4mvN//sL93sHV48P3jVPW7zc/GzfvZ6ISwNk+RnOazJlfJ0SS628+aGcnrPjY+KB+bsne1k5nuNu9jEtvtPdXAK1NZZt6Oq1zsZFD9Pj4895qSETFGQmroQ6TUSfx4jL3cK/XxrpOB90V8KJ5VqOp6DZJcC9W44rE6MKH29qzW9TPIT7F5823OddnBqrG9K9lUqi9cGCKqe42ck8/BDuJdJwTmH+4CcwMOthGbYopkl1usKTloWfMeWeVgwToK22wn2GP9Nh97J7IbcrJe7TEQSYYcawgUHQJ6gH45bC8vOyGIX9xpiUd1tKF5R56ataFGSY2NQxNKf11zwK/p2/7To9amv9XRwgMoyVYsuWL0YBzZxijO1uCHcbQTAvMPd4G5AUfbKRtJ8hQ0Im7ZRaN5j8nJrXS0RmdsG/heLSSeJLLf34nshhxt15E6JnbSkJMksS7bUtn0c7S2j6OdEMQv7rTEozpaBuOxQSaqPmVnC2cW8wWFWexXyoMlTLbDgz8pFFuHOy8OnpaftZv3s9ZHFIjsWislpJAtRbB2RacRmrH83M3aB+VmvQuFgw3ivFpfRqjOmmDDyv4kaL3dDnS3m50QsN/fCeyGvKw0i5AdQ5DMHSHVhmIg8HDkpwkh/OJOMzyqk43FpJwCUqWq3lWT21iSGujBneySGOq73W8PDne2flww1w8PdveflKd1D2DrOKNrDFyleAiQYiBqif0QGe3UAP3DXYBuYvtYlymgZL9wuWAbUeo6Pqx0t9YxbbsV3nZi4H5/J7ibcrmYwWhym1siV5DR+Jzqkr6z995BnhrML+40yuMmt77qsExwyZicExnxppNW7F+u7cc6RrwJ8d6L3f3vnlad9gGwjWOz1RDoovLVBKzZ1lALxyGc7SRQ/AM8LJaxq4w5pdBqrJUCaMbDTf+s8rBEgH6bV7jYSUD6PTxAdjFZcd05SnLGalpLtrpigx8wlZ0Eti/gwbCK0XOtGGKOqVixxYjxvl0/mTWzipdhu7j9G9A+u4vVNqhau89Rcgqh+hxqlopYGwaRmTr8JXDdSY4YULJdSu5uLDSk4otLnIGss3bmBH8ZXCurqAPItgfCZKUCQjHBW4sOFT7XU8LW8EoBiAnhhbfjtTbtdh9KhJZtSAzZR5IUcor94LMO/QzfJ/juSPrX3KdaEptGTWJuVkOUgN7pQPppsETaDrPJ/Igh3Y7huiTcc7TRisGWSm0JSiQkn6mf9NhsPi+x83dtzqxPxJ2ZMmARo2FKiOoCG1DOPRuXzPhd4ndHnrdOGffaoABkLKSZgUddjJ59Ij/j94X43ZHNjSHk3qxIBOOSkQyNTbUpOvI44/hlONo7srz1SLl3VEpdd6iwaegZWGpIKZueQSjRtgkzeB/AuyPnW7ecO1sGjV0oQdB/KGpSmzSeHeGXYngHa2d9gu5orLXdClwc/Qu16biaKzN6X4reHVn80JLupiQyxEahQyqZNPtDajhj9qWY3ZG6Dy3q7ht0TUsIc0ZpIuysd77NYcqXYnZHqj68qrsvaCgEG0kjS9LwpFWOlPupulu7bf2M2wVueNch2rV1xpZQTWgdG6aE2DRJSAGqF5lX3Reid0d8ub4e2SW1BJZK0ggza34uRlegZTuzmO6C8PLOr2PIY1Vdg/EBTRUkqBYiBUxF07syhPjwNKCK4xRc2WIuFipyNDVZwmQ8MNWZgtQfqtXiEENUW9EwZuMFYjKOQWKtrLD165jmeeVOyUSwsqsqrb97cfD64PCPB693h6q5XrniFXZucrFwCNKVXq3oYCSg9Nv4cvonrIpMJoInbqr0ytZpYOk55sh6++hTs6L/6Ud/YHbbBDOCdxfP11V45VjBc0awIIRCXnFMErlnz6ft2ZSuqJivs+qajUFynnT9FUpiWZ1hvThpMkBCNxHswmYqrsYmgGBsJzEWSQcVpHBdolm1NIpxbo44VxbMxyi4esuaLThfAsRYLKVchMmZnntiYRtnC7qibr6eemtkslbElVYtcmlSoMRQ+/HFwPo5i1hZKF93rbVYo7mDs1FKtdV7riW3EvpVfrzb9rMFXVEtX1+l1aWYImQQpwEnqRt0KbCRnm3PTdy28/JbUSYfutAanWZ3yUIsxVRiyzFyoZ7tYT2GbeIZsrtr40PXWSu2lhLGGH0RE1vynjiA6+nkImybGbMVtfHh66wpSgDmYE0NgM50+phRoOd+Cho3o7ayOj589+zk0fqcC7vMTv+aQHrTlXuutU7+Ms6oKWp3UNjX2T4bgxf2PkSTOLcsgN2x1tazZ72u0G1PM36K3x0bKuvsn53VyYWWqoTssFky6vqycbZfHQHttscZPoWPN0FNAYqE0ZQUAxMSU2avmUG/bRQI23P9oIMu3sVL2R2Kl7J7nZeid6lmUjRa1HSgSCeABqVCGE/V7jFieHnnG+KlsMdWfXX6RdddrV5DloZi16tX95SgGomXApST1RvU9WW8YIlkhMt1abI1iM89JaRGoaWkECKJNZi9wgW6siRXg9g7/jAzVH1YKcOf/xcNOWoMJtSaciapsSPqldJTvgECb/OM3SYZKMFYLiHZrtdEq+xjswpqpZ65G9HK4H8iCG6AgQJdvyZ1bi0yBWKXNYR0hk3vQhzSDN3mOCjNlya2gWN1ekSKHHnxDD2Np+NtO+P3AIgMIjlQ0kw5phRSLi4CNt96EsFWZuATAXF0GoNz6Aq45IkKZhPIUW7B91t+IW67OUHYMIvBITNZXX6Sm37vqqMQEvar0VnA7ehnCDdFY/C2hubElq5dUq2lekzGpZ6Bp0G/uhnLNNAbkcfgc/Y1m1QERVKBphFocw2GYc1OBK8RSQyJPIKtxXP1PgWBwrn4kPvxTsBt45zbjc5h4GIsmGZzyM55gogIgMn1PNUDftvPbm1FNXx4DoNByi5kaN3AnMm1MbnU84Q/oKFtmFFbUQNfL4cBogtW83HS2CIYqrFI6yki5Sls2zmNW1EDXyeFoXIiFG9cl8UFy5IUwOr6RSYu8LaZV9+KOvj6KAyNIqVCwcfkTciai5dUje/HPwFadZJuGtDdJYyyPmkNI90JEL397HxA37I0bPY6s/lOCgP1k9YwsKS58f6rnx4jgh/ve0P0ha6/XjOU1NvpYks5OGf1F5ohZDWePkwjURcIXHE2WC8hIbqg99jVeVb3MDAuum1YkbY9fZhG4S1Ej6RLqILedcgiodqMzfQ8iQMreQsTgGkDnIUUAVJ35I2NN80ljK5LuXue7KDu9Nu8vPrwFV4NSFi4susfQqhAkhNCk0hgckoQe55/AxPsto+Tx28DbAUnJmlsz9HnkhmqBh5VLMWeOyQWV6bYE8BtQ1SFJBVNg4QNI/pc0Xur+fVAchkTwO2Ovcjvdn7YPfx60C4uc7mL7HwqxrUonJi9pUTOQU9mHs6hycbUTTTOZ03KkovIEaV2CZpVJ9fPTDqGbfSTx27DjCCqyfruCKolFyS0pGkCfNbpcTaXd+A3OhnI2mRMa1zIplaLL6mEDNKTjWADbhs7ddQ2SQXyhj1V7hK7mLJiCb6St6Gn1dQ15yYP32bUTNiAKRVaDoBJoYPYrPH9lLWDhW0/+aRgTAZQyYh6c8BJJ9ZSCxBK13S8p4Ks2YYZrhEJQFSdBiK+5ebUOlp2MZeaTL/VpSjjNvLk8RqV/ROgOjQQEmOFmCDZElzoex4Ho6PtGbFR1UuolmSQg4ivMTUjWCu20lMOT5O8lSy7CSC2IeUS6EAzXddizJ5ccpB0ZKHnERyHvO3msH9DqiUh6GLTtBo9sOPiW4gSdS32PLno/HacY/6NSJb4WmqxnWJ9Dq4EKJ5CC6lfsha3afLlm7vlStbF9bFMqaHp+oTnZoViJ/gUqD/Xx/fk+tib+P249+z1weHey4OtVzs/7X73GKH8NIT7kUoG4f7UEmMXJKbAtkl2tcbg7HXd15vcH5hhWwrbXSSTYclApfkqJXLwyWJz1qJhwlVkIOc9wDavygemhxuMQA5ysduKRCDmpDC4zI1ilZ5pAQCuLANMDzccny3U6YcakcTCsXRNrYoz4bPeVne1TDKrs7vp4eg21m8nGh1D1rVpAKxxIXRSXrFnvkeoOcOM5hdwUtbFJUID1GxtLNlCElurayn3PLsPwW87P8PYn6KyTmpRcBExFU4mcdT8ImFw7HuKf4GP236Ob76AurIetlHV4WATMk7/k5xtHEhXZb86g7crtTQmiCFvhn4kBSBKDjlrwpGy7fZqks399mYYeaWmxgShjJtlI9mieWCKpmANCWLyNXkH1FMFQCEFO0Pan+qyHoISiPeWXKIGRKaWJi4Z11fm2bs55Pkyxsu6CUsE2ZnMvrlkNfqR2qhrUN6TDe9pG+MMZ38ezBp1jIxoGpJyZm4k2Te/UMnpd5yIPZltmlPKL6DIDK5pFMBiBhs8RGBiXwKa0DPgARO2Y5jh68+YGZrhZErGlEuR3DI1dCU5p2uwp180hLNf/CL+zPCMp5hdKjZrytiaNAi5WoK+0h0QYo+GkhOEcFTxIwSn/1Itlox6Px1mihF66owhubgN8ybOAxFCAlti4UIQfIii33iXbbV9T0LEuFLIaoJYbkgVqVUPUlKp4kI1FRLZ4mxPtraGQ5o0wozlQ5BIijpC6VZmYLWxtQtcYjK23y45wzbMHvJh6CXVjqpoqdiUhDRWZa95I/DgLZ/oJp6HB3/SmX+MMF7e+YY0kwoHisY6YZeINOtjo+mGk7t5UzRDNbZuUse9Dxg0Em1EyaaAJfiMK6lSFq23qxWlJwHVKNpJPmpYCRGDj56TcQXZNjWHPfc/V4tJTwOqDegnFWnBJ89CxaRO9S+gWJf7hSLo0axseDEN6DbW8impjbQAWUfRuMXEBdFRM30PveC2wRnBzYgocSR0WVILhMGEFGvMYmM/VqntyvM8Q7c5HSWXC5GrTQeaIWMNkqzJPWUmZp+3WWEe6tqbhxBa7U6dleQYkKWnxLTB1QLv04Bvw9o80Zfik1ROzjr1ZsFpHp6xJ4x2O8YZxU0o9EQNHbPNyVBCJuuTpdb6Un7RwTaFGbjNivSklF2BkMkH4zVqiZQoWOkbeLqVpdqJQLgRoZ4SGau3mLwHS1adofExuJ7ggds28+bK2GI9mtpJ9MY2hzbqAI3N+p/Ss6+23w6zrxtbsMeIS7URNB/VWDZoXC2nnoI9ZtvbGbHRG3ZpdKE5OWRjCjQnLiSDJvXLyaPbxhmzFaSjHw/2X+/+aYCVdnGdK5vQWWKKyaUoGTg3U4IrPbmb0J3C3o4zeKPTjViIjIaPaH1u6FPOUrv9sH7F8I7yN4O2QYYRORNCEUjWllZaZJ85tNgvLAm8Hebd5w1yinzHYKAUanPE0TdXgq/ie3L9dNmuVOycCH4b4RH5EG01zepgAkpu0hTG4ty8Ad0fuc0wh3RwPmIWZ6NCZgG4sNeh3E1BMf0oKH4Jbnuvd7a6PZw/P0rs9O43J9iTmdmwoW6XuVQskTxZJ4NgtbAbn2H1j3v7z/Z2Xm19u7/z8tnBY8Trwwg2xhvSUISIMVivoQky5dx1F+LWm5dnXT+RrLBkpe0839nd39r7dufwcbakvBjAJlsaAqeWmkGKtjDmFDUR9waGWG+TQmyk1Zaj9ywRarO2E/0Izih+tqxi6YF1FLZ51XH0KSE2ClkvFW8TNL3tZhQ457szd0L9MjbreaWU2aQQ2wBnD7yhmFFvN1nvCvnKzYDt21Qool19zHVSGG6MvKcejqnThI+UpVAVACOt9mNfOkfblmccN0rhqxIESVef05sXBJNcqhL7HcpCpNmYPgAin7TFyZ1qM2UG9Yq144XZfiBGM2P4AAh9TSJmckxkctA0HWwtjfvSUYLZDn5G8cHw+ooBdCjeWSkpWls5USmxX+X8710MvA004/kgiGINqdXgivHihbt+fM2X1HNlktsGNwO5YbqYmJypRmzNkBMKjCnYVvvpW1kD23ZejJthjWFKkthHwGxcQ3FFE0WgfovPBlp5xGRayI1IHgvcEaQdVxPEWUfZk2Tbs9tbdNt+Npsb45CZlqFFMur12BH6GGtMPTdoot+eN2c21f5NWPRT1oJtKVsJtZrog+nXIIDjdoAZuo33EmuNvTWZ1XiGRM0nE6zUngJW+ku2aU4FN91VrDIDcKRkxefYEKvGoMbXnuk8z3HLA2gxJqU7pGBSy1yqaOBp2aRqe5fhr7XNuaOoy0taxL3QR+qHP28d7v14QUR4dL3iLgawSZmcQN4Elk5zLBdnGDkWhGHq8JOCbKRCfAUSqkUaNhtKicn4hPW6+O1y4VSditWijZOCbJRKfM2xZKeGMVhnTSFjgDTt474p3sremdOCbGUp/ncvDl4fHP7x4PXuUEX5K1e8ZOV68U5zvuqJuTQNXiykwv1OEAVyvO3mpfggyvPCzrEaVB9J/xeheG+Sr/1Oqdu4mikzLRw3UJ6ProJjNGgxGZeNiVYtrunXVjrabY8zgg+nKti6IoTTrKLVVIN4LKj5BLqeib2f1+PmS0mpk0j1YhCD06EQExqS0C+xD3bl3ui0IByxkhSaMWRTBM0ooo+QuEXBAn2P127THNVsrCLRUHN5TQ4pooliASxBlNhzO43JrdQimBh6ox6RJoylSGgx+ZQaJdOCJMR+RVy0GofO4D2Ao9KegVp0jZ06PTbegU0Jekp1aro/p4UP4cg0kYadvpZgmTy4lAnIQX+BkDCjuPGD0yDYckBgNaMFQ4jR5ALQ8wQFzUHo5k9QS8EmNeWKLXLHsLAxu8/2Tu99KnfJyfefftjf/dPe1uuDFzuv9h4jfhcD2Nyh3AyL/kO5VC4ukBgdQSvFDiNWMC3Ixl1yf/m7b47Ozt7rSvn9f/4f3+ST0r37tyqnb9rpybs3Z/VtzedHJ8cLJM/O5K8Le/d2S07zz0e/nmwdn2wdvdNf/a5uvT/ekt/+75PtrVf6/Zls1beL/79V9Bu9nd/+9aScbC0umPWCUk62vxKYi4n8/of9vc+6xnSD0YGd1V/rxYx8c3TcTvQzF5Olb/+PJQ9z9zR/mADJ5+/l7ZvFjJ2fnOu3747O3sl5/vnzeVi8q0PcettBdLb1y8np1tvf/vW4Sjc1+eToOB/pu/nkeOutnG3pOOVsMUP6ypk+saLfvDvZqr/qp/SjstY50YfLfnN9Yv6bnB4fHf/1+tx87vK6hOi06tDOq84YMl9QMLK8ze/fyscX4zbA1Ul8VE/R3ovd/e925seo16QsjNSXP0eL5i6XzxER4GLb9upzdPFi4Ef7IH23++3B4dAP0qOagd39Vz9Nefy3tDKbvDW5Y17UoMB9HJO9ZlBcJ3j8uUHpXoTtYK/OZBd/vpG35/X0WDqK2tm1CTysZ+/f1eOtv+nE5J9l6+i4HGU53tJIVierHLV6usgttrd0qk8/fLie6VRu/XJ68ovGUufdd90k/yJv/6F7/fJ3iT5wn6Z5/fP6bbzvtK5g8emo38np3zqCUeym/EMY+nsADecf7dJdJiQ2LeN1U47rq8f/tFbb8gm630JbqLn1XWjRX11nDI94mS3VEPvq5+zic286n3WuF+gc5T+/SX97cy6nf63n15+6ffnwuJ0dHW/l3/6tHP21G6g+YG9lMdSFc9Tp+fjE/fb/Hh/lk4Un/VWvL/q8npyfyuIx/eRR9Tnd3jpUt3kxlccn79JpHXXK+jx1F9uyF4/VdV26S1m6D3O5XLXurknXaWtvj/L55w9fF6qcfJrpc33E64f56Rb52fnR8bkGKnqR0/ppzj+YhOuRic7rx6v8bUveJf2pj9f5RRSQ0276j377t+OnPe+Py6ksObowsZxo2Qb74BbvqS2+nrPWK6blm4tPL//T1bLN9cV3vajzlBKxW6f1vmkYX0vDLo8cXM3DLl6lx7ux82Ln8Ifv59j4PlP0zbdwr/1CuPV0y2X6GQKaq4GxvXhhiZm8WKq/ni0W7tkNG3miRrBbqhfhXT3Leqe69LqV+WH6by7ZLb0P6X7o7P3ZVn5/0sFyucb/ofuJRVBZ3/3yVv5Fup9YBIzdo/oBr4c78/rwLFau/TjFi3l7o3f9adof7WJeWn376tX80b98eMYWD+uNvOPDA/DhObvyJHQL+khX9MJfXD5anWO49dHqPnS8dXx08b168vP3f9Mryfvzk3e//c9ztRbvFlnJmJPWKxamq4vYAdHnTxji4rWnayxvnc17rllLq63lp4n+aC2XzPLFE35rLPlpUeqjuZiyn0/+63XTqP/ayak+vIuc+SKT1qf86iL++Ph2E39y3D26nUHQ+EGT78Gix+c7L1+uLETU09OT0+vzemG+6vXiefdg6GtvOjfxc3eZ+JfLFzvT9+HS3f12AeTlB8FcffnTR69OeTddGie96Z7Kt+dv3h/Lr3ozkt7WG5sWv/3b4qPd/F3E8Rc/o3O6dfz+3W//67Tbpfjrezkt3UsdKscXn1NDuxjrx6nXN35Va3NeOxeX6+lAhvXZDwevl6XL37z036yyrR+mQd/7D3vP9VcfHP67F/53+/7v/ss3W//lm3//TRdQ5p8XwCyLx3tbho9zcvwxLL9qHK4E38efRd96ge4517znSLqfPbuc/LMPhnwRA3+y7mfrLsPG+1Zhl9GoPlmJ6xaisw7db+lu5oIl8lFr8yPUWV3UmfquLAun//tPv/HjFZfSUT7YmV/lbUchOj99XztIP1z7I4Hh1ktf0l6+8MqfJnP4S38q/Q5/6Q811eEvfLV4NPzVP9VT1nDpi3344S98ueO3hpv+uBG2hifkU1I//LU/ZRfDX/oyChr+2h8DgAGu3DSQv/aQaNCzqN7cuLamemqKP/9ouOOjf+k+3EWpRc5l4Qc/BAsLa/WHv+/uCYzxf/+fdoxx4d/hv9/+r790Nv7sZ7HkO3ZisQ28FUPZgnOFCiGJ8yEFYsYINVQSscHX7hNgTQ42spfgPIILy2fgg7c5/9sv3Z10PkbTk9K5kc5Z6jtH7zr/+n91blljbb37DyzCT86l2wy82X/FXNI9Fx+QJSxdBzcpn5+zPG/41rsn6xqd8+sn7PO45yJDeyankk7Sydb/9/9sLabn+AbB87lGdltLjmden6xP/M6LSb5K7wSznN95IezislgRCSLkWBATJ+YYrk/xm1P5b/rhP8PWzuHiJz9sICtyPy+u+k7ONJjSSPTo/3yvQCtaR10q++FJ7SHv4/twsSeI8vJJuy/ayYbCDSrVSi5Cyal2Q2hrQPvsn7uKqn7sxnq+uqD3Z5CXztV9AW4uJjaJbCrZADbrxSYIdg0A/7NeSk34DXL+5fHCRbZ+mi829maUP5uw+0IcbULHRsRDVYCbs3rHreU1QPwV/hifNrx2Xf4YrKfisFO3KC1ErhJri46Xo2u39l9s0h9PD+Vh/TFFABdzKEWqIJP3nZqJpzWgfas/Bl7hj6cH8nD+2KonNpxTxCDcnKu2sncB1wDwV/rj6aE8kD8uNUYdgEZerqE16Is3mbGsAeKl/hiuKBTf6o8hPG14cW35MbUavWR2XkfBiDHYwoueCUvQxa2d1xv0xxNEeWB/rCPKcaGKE0MxgdG2yOLXgPbt/jje7Y8nCPJw/riW5CmV6gyFqrEWScyeHK0B4K/zxxNEeaj8ODAnhx5RmiUhthwiLNqFDQ3x/fNjeuLbH25d/pi5aigdbNbbjzoVyUPNxt+Crtt6vr9BfzxBlIf1x+iTja0TrEOnmbIJ3WZXTn4NaN++X23u9scTBHk4f+y56fyWJE5cddai1AAGcA0Af50/niDKA/nj7HyiGDyFXBRoagUSoFuHxb6/P7b2acNLa8uPG9ZUYoBqXGy1Jl806LKwHF3a2t+kP54gygP7Y6ScG0LpSsiWDKHBEmUdaN+eH9Pd/niCIA/nj/WOCyWGYlig5GKCUZQtrgHgr/PHE0R5IH9cg6WIXT90qj65WFPVpCrQGiBevl9te6THTxxdvy53XHVYFSAWDbXIanAdNFmmuDxh2nv53Q+vXh/u7azJJ0OfFHl6SP//5dxLasMwEADQq+gAIUiW5Q/ddhfooqGLFryQrCmkECe1UmgXgd6hN8xJMqMP+fYDdVbZGIwtM9LYHnvxZtiSnFfGcKF5IbK6rvJSPJelUvZiGf+2Lhe//CZfX6KHK8tKcIuvbNmammcqy2tjrdKtvFSS//mvfH2pHqg287JoK4txCmhz/NJWGUhjhs1zM4oAKuG2BHV+WIbDrq9nAdEBOwvD9t0uHiZ2emx3z5Ldm8CjQ+MIx57E5vMLP0SA7WbMenh9I/xK5qrvwS0XXURXc93h5AK4xtHaAS4buLG/w/8ceopbcs5S9Qq8y7PwEUW+8HE6mMVODFHXSi6OWJgnuRrzY7WFwHJpwElIkbjt4plOHsnewfsSZ6A9Lp+tSKB9sMk97dIzSHLsBcbsLjq9ObXW6PwCBFVGJz5MbyP7JYLY4/VWmq7hp4Sb1IZj3aybLRvP6lo='
+_NX54_PHOTO_SHA = '4d2f162a05c2144d5d535a467b7588391e7e5aa276e5c21120c72986a7463147'
+_NX54_METRICS = {
+    'sales_goal':('Venta','USD'),
+    'new_goal':('Clientes nuevos · programa','clientes'),
+    'activation_goal':('Activados · programa','clientes'),
+    'collections_goal':('Cobros','USD'),
+    'active_clients_goal':('Clientes activos / cartera · planilla','clientes'),
+    'line_count_goal':('Líneas por activar · planilla','lineas'),
+    'activation_rate_goal':('Cobertura de cartera · planilla','proporcion'),
+    'line_sales_goal':('Venta por línea','USD'),
+    'visits_goal':('Visitas','visitas'),
+    'sky_liters_goal':('SKY · volumen','L'),
+    'kr_rate_goal':('KR · criterio de la planilla','proporcion'),
+}
+
+
+def nx54_metric_label(metric,line_name=''):
+    label=_NX54_METRICS.get(metric,(metric,''))[0]
+    return label+' · '+str(line_name) if line_name else label
+
+
+def nx54_init(db_path=None):
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        con.executescript('''
+        CREATE TABLE IF NOT EXISTS nx54_goal_sources(
+          sha TEXT PRIMARY KEY,filename TEXT NOT NULL,period TEXT NOT NULL,
+          payload TEXT NOT NULL,created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS nx54_metric_goals(
+          period TEXT NOT NULL,advisor_code TEXT NOT NULL,metric_key TEXT NOT NULL,
+          payload TEXT NOT NULL,PRIMARY KEY(period,advisor_code,metric_key));
+        CREATE TABLE IF NOT EXISTS nx54_goal_log(
+          batch_key TEXT PRIMARY KEY,period TEXT NOT NULL,payload TEXT NOT NULL,
+          created_at TEXT NOT NULL);
+        ''')
+
+
+def nx54_shared_goal_files():
+    import zlib
+    if not _NX54_SHARED_GOALS_B64:return []
+    return json.loads(zlib.decompress(base64.b64decode(_NX54_SHARED_GOALS_B64)))
+
+
+def nx54_photo_goals(raw,filename,period):
+    sha=hashlib.sha256(raw).hexdigest()
+    if not _NX54_PHOTO_SHA or sha!=_NX54_PHOTO_SHA:
+        return {'metadata':{'filename':filename,'sha256':sha,'period':period},'candidates':[],'actuals':[],
+            'issues':[{'severity':'warning','message':'Esta imagen no contiene una tabla que este lector pueda verificar automáticamente. Usa un Excel o la tabla de correspondencias; no se inventaron metas.'}],'sheets':[]}
+    source='Cuotas Carabobo · imagen'
+    values=[('Z1 AR',200,60,2200),('Z2 LM',200,60,1800),('Z3 AT',156,60,1900),('Z4 FL',200,60,2000),('Z5 LL',200,60,1500),('INDUSTRIAL',12,1,600)]
+    candidates=[]
+    for index,(ref,visits,clients,liters) in enumerate(values,1):
+        for metric,value,unit in [('visits_goal',visits,'visitas'),('active_clients_goal',clients,'clientes'),('sky_liters_goal',liters,'L'),('kr_rate_goal',.2,'proporcion')]:
+            item=dict(metric=metric,value=value,unit=unit,advisor_ref=ref,advisor_name='',supervisor='',
+                source_file=filename,source_sha=sha,source_sheet=source,source_cell=f'Fila {index}',
+                source_label=nx54_metric_label(metric),origin='image',priority=100,period=period)
+            item['id']=hashlib.sha256((sha+'|'+ref+'|'+metric).encode()).hexdigest()[:24]
+            candidates.append(item)
+    return {'metadata':{'filename':filename,'sha256':sha,'period':period,'source_type':'verified_reference_image'},
+        'candidates':candidates,'actuals':[],'sheets':[source],
+        'issues':[{'severity':'warning','message':'La imagen no imprime mes ni año. Se usa el período seleccionado; sus códigos Z1–Z5 e INDUSTRIAL requieren correspondencia manual con los asesores.'},
+                  {'severity':'warning','message':'La imagen imprime 300 clientes como total, pero sus seis filas suman 301. Se conservan las cantidades por fila.'},
+                  {'severity':'info','message':'SKY se expresa en litros y KR en porcentaje. No se comparan con ventas en USD ni se interpreta KR como comisión.'}]}
+
+
+def nx54_parse_any_file(raw,filename,period):
+    if str(filename).lower().endswith(('.png','.jpg','.jpeg')):return nx54_photo_goals(raw,filename,period)
+    return nx54_parse_goal_file(raw,filename,period)
+
+
+def nx54_ref_key(item):
+    return str(item.get('source_sha') or '')+'|'+nx5_key(item.get('advisor_ref') or item.get('advisor_name'))
+
+
+def nx54_resolve_identity(item,context,overrides=None):
+    key=nx54_ref_key(item)
+    lookup={str(a['advisor_code']):a for a in context.get('advisors',[])}
+    manual=(overrides or {}).get(key)
+    if manual in lookup:return lookup[manual],''
+    ref=nx5_code(item.get('advisor_ref'));name=nx5_key(item.get('advisor_name'))
+    matches=[]
+    for advisor in lookup.values():
+        keys={nx5_code(advisor['advisor_code']),nx5_code(advisor.get('advisor_alias'))}
+        alias=nx5_code(advisor.get('advisor_alias'))
+        if alias:keys.add(re.split(r'[-\s]',alias)[0])
+        if ref and ref in keys:matches.append(advisor)
+    if len(matches)==1:
+        if item.get('identity_method')=='unique_targets_with_numeric_detail':
+            import difflib
+            source_name=nx5_key(item.get('advisor_name'));known_name=nx5_key(matches[0].get('name'))
+            if source_name and known_name and difflib.SequenceMatcher(None,source_name,known_name).ratio()<.65:
+                return None,'La ficha coincidió en cuotas, pero su nombre no confirma la identidad del asesor.'
+        return matches[0],''
+    if len(matches)>1:return None,'El código coincide con más de una identidad.'
+    if name:
+        matches=[a for a in lookup.values() if nx5_key(a.get('name'))==name]
+        if len(matches)==1:return matches[0],''
+        if len(matches)>1:return None,'El nombre coincide con varios asesores.'
+    return None,'No hay un código o nombre único confirmado en el equipo del período.'
+
+
+def nx54_table_grid(raw,filename,sheet=None):
+    """Ayuda de columnas para una tabla nueva; no interpreta una imagen."""
+    if str(filename).lower().endswith('.csv'):
+        import csv
+        try:content=raw.decode('utf-8-sig')
+        except UnicodeDecodeError:content=raw.decode('cp1252')
+        try:dialect=csv.Sniffer().sniff(content[:12000],delimiters=',;\t|')
+        except csv.Error:dialect=csv.excel
+        return {'CSV':list(csv.reader(io.StringIO(content),dialect))}
+    if str(filename).lower().endswith(('.xlsx','.xlsm')):
+        import openpyxl
+        book=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True,keep_links=False)
+        try:
+            selected=[book[sheet]] if sheet else list(book)
+            result={}
+            for ws in selected:
+                if ws.max_row*ws.max_column>2_000_000:raise ValueError('La tabla es demasiado grande para el asistente de columnas.')
+                result[ws.title]=[list(r) for r in ws.iter_rows(values_only=True)]
+            return result
+        finally:book.close()
+    if str(filename).lower().endswith('.xls'):
+        frames=pd.read_excel(io.BytesIO(raw),sheet_name=sheet,header=None,dtype=object)
+        if isinstance(frames,pd.DataFrame):frames={str(sheet or 'Hoja'):frames}
+        return {str(k):v.where(pd.notna(v),None).values.tolist() for k,v in frames.items()}
+    return {}
+
+
+def nx54_parse_mapped_grid(grid,filename,raw_sha,period,header_row,identity_col,name_col,metric_columns,sheet='Tabla'):
+    if not identity_col and not name_col:raise ValueError('Selecciona una columna de código o nombre de asesor.')
+    used=[c for c in metric_columns.values() if c]
+    if not used:raise ValueError('Selecciona al menos una columna de meta.')
+    if len(set(used))!=len(used):raise ValueError('Una columna no puede representar dos metas diferentes.')
+    if any(c in {identity_col,name_col} for c in used):raise ValueError('El código o nombre no es una columna numérica de metas.')
+    records=[];issues=[]
+    for rowno,row in enumerate(grid[header_row:],header_row+1):
+        def value(index):return row[index-1] if index and len(row)>=index else None
+        ref=nx5_clean_text(value(identity_col) or value(name_col));name=nx5_clean_text(value(name_col))
+        if not ref or nx5_key(ref) in {'TOTAL','TOTALES'}:continue
+        for metric,col in metric_columns.items():
+            if not col:continue
+            source=value(col);number=nx5_number(source)
+            if number is None:
+                if nx5_clean_text(source):issues.append({'severity':'warning','message':'Valor no numérico en la meta seleccionada.','source_file':filename,'source_sheet':sheet,'source_cell':f'Fila {rowno}, columna {col}'})
+                continue
+            records.append({'id':hashlib.sha256((raw_sha+'|manual|'+sheet+'|'+str(rowno)+'|'+metric).encode()).hexdigest()[:24],
+                'metric':metric,'value':number,'unit':_NX54_METRICS[metric][1],'advisor_ref':ref,'advisor_name':name,
+                'source_file':filename,'source_sha':raw_sha,'source_sheet':sheet,'source_cell':f'Fila {rowno}, columna {col}',
+                'source_label':nx5_clean_text(grid[header_row-1][col-1]),'origin':'table','priority':100,'period':period})
+    return {'metadata':{'filename':filename,'sha256':raw_sha,'period':period,'source_type':'user_column_mapping'},'candidates':records,'actuals':[],'sheets':[sheet],'issues':issues}
+
+
+def nx54_column_mapping_ui(uploaded,context):
+    if not uploaded:return
+    with st.expander('Adaptar las columnas de un formato nuevo'):
+        st.caption('Para una tabla Excel o CSV que no se reconozca, indica dónde están los códigos y las metas. Selecciona columnas de META, no de LOGRO. Las fotografías nuevas requieren una tabla verificable.')
+        supported=[f for f in uploaded if f['name'].lower().endswith(('.xlsx','.xlsm','.xls','.csv'))]
+        if not supported:return
+        index=st.selectbox('Archivo para el asistente',list(range(len(supported))),format_func=lambda i:supported[i]['name'],key='nx54_mapper_file')
+        file=supported[index];sha=hashlib.sha256(file['raw']).hexdigest();token=sha[:14]
+        try:tables=nx54_table_grid(file['raw'],file['name'])
+        except Exception as exc:st.error('No se pudo mostrar la tabla: '+str(exc));return
+        if not tables:return
+        sheet=st.selectbox('Hoja',list(tables),key='nx54_mapper_sheet_'+token)
+        grid=tables[sheet]
+        if not grid:return
+        header=int(st.number_input('Fila del encabezado',min_value=1,max_value=max(1,len(grid)),value=1,step=1,key='nx54_mapper_header_'+token+sheet))
+        labels=grid[header-1];columns=[0]+list(range(1,len(labels)+1))
+        def label(c):return 'No usar' if c==0 else str(c)+' · '+nx5_clean_text(labels[c-1])
+        a,b=st.columns(2)
+        identity=a.selectbox('Columna de código del asesor',columns,format_func=label,key='nx54_mapper_code_'+token+sheet)
+        name=b.selectbox('Columna de nombre',columns,format_func=label,key='nx54_mapper_name_'+token+sheet)
+        metrics=['sales_goal','new_goal','activation_goal','collections_goal','active_clients_goal','line_count_goal','visits_goal']
+        chosen={}
+        for metric in metrics:chosen[metric]=st.selectbox('Columna de '+nx54_metric_label(metric),columns,format_func=label,key='nx54_mapper_'+metric+token+sheet)
+        visible=[list(r[:len(labels)])+[None]*max(0,len(labels)-len(r)) for r in grid[header:header+8]]
+        st.dataframe(pd.DataFrame(visible,columns=[str(i+1)+' · '+nx5_clean_text(v) for i,v in enumerate(labels)]),hide_index=True)
+        if st.button('Usar estas columnas y revisar',key='nx54_mapper_apply_'+token+sheet):
+            try:
+                parsed=nx54_parse_mapped_grid(grid,file['name'],sha,context['period'],header,identity,name,chosen,sheet)
+                pending=st.session_state['nx54_pending_batch']
+                pending['files']=[f for f in pending['files'] if f.get('metadata',{}).get('sha256')!=sha]+[parsed]
+                st.session_state['nx54_pending_batch']=pending
+                st.session_state['nx54_batch_decisions']={}
+                st.rerun()
+            except ValueError as exc:st.error(str(exc))
+
+
+def nx54_preview(files,context,advisor_overrides=None,decisions=None):
+    period=context['period'];groups={};unresolved={};issues=[];seen_files=set();sources=[]
+    decisions=decisions or {}
+    for source in files:
+        meta=source.get('metadata',{});sha=meta.get('sha256')
+        if not sha:sha=hashlib.sha256(nx5_json(source).encode()).hexdigest()
+        if sha in seen_files:continue
+        seen_files.add(sha);sources.append(source)
+        for issue in source.get('issues',[]):
+            it=dict(issue) if isinstance(issue,dict) else {'message':str(issue)}
+            it.setdefault('source_file',meta.get('filename',''));issues.append(it)
+        for original in source.get('candidates',[]):
+            item=dict(original);item.setdefault('source_sha',sha);item.setdefault('source_file',meta.get('filename',''))
+            if item.get('period')!=period:
+                issues.append({'severity':'error','source_file':item.get('source_file'),'message':'Una meta corresponde a otro período y no se incluyó: '+str(item.get('period'))});continue
+            metric=item.get('metric');value=nx5_number(item.get('value'))
+            if metric not in _NX54_METRICS or value is None or not math.isfinite(value) or value<0:
+                issues.append({'severity':'error','source_file':item.get('source_file'),'message':'Meta desconocida, negativa o no numérica; se conserva para revisión.'});continue
+            unit=item.get('unit') or _NX54_METRICS[metric][1]
+            if unit!=_NX54_METRICS[metric][1]:
+                issues.append({'severity':'error','source_file':item.get('source_file'),'message':'La unidad de '+str(metric)+' no coincide con la unidad admitida.'});continue
+            if unit in {'clientes','lineas','visitas'} and value!=int(value):
+                issues.append({'severity':'error','source_file':item.get('source_file'),'message':'Una meta de cantidades contiene decimales; requiere revisión.'});continue
+            if unit=='proporcion' and value>1:
+                issues.append({'severity':'error','source_file':item.get('source_file'),'message':'El porcentaje debe estar entre 0 y 100 %.'});continue
+            item['value']=value;item['unit']=unit
+            advisor,reason=nx54_resolve_identity(item,context,advisor_overrides)
+            if advisor is None:
+                refkey=nx54_ref_key(item)
+                unresolved.setdefault(refkey,{'ref_key':refkey,'advisor_ref':item.get('advisor_ref'),
+                    'advisor_name':item.get('advisor_name'),'source_file':item.get('source_file'),'reason':reason})
+                continue
+            code=str(advisor['advisor_code']);line=nx5_clean_text(item.get('line_name'))
+            groupkey=code+'|'+metric+'|'+nx5_key(line)
+            g=groups.setdefault(groupkey,{'key':groupkey,'advisor_code':code,'advisor_name':advisor.get('name') or code,
+                'metric':metric,'metric_label':nx54_metric_label(metric,line),'unit':unit,'line_name':line,'candidates':[]})
+            item['advisor_code']=code
+            item.setdefault('id',hashlib.sha256(nx5_json(item).encode()).hexdigest()[:24])
+            if item['id'] not in {c['id'] for c in g['candidates']}:g['candidates'].append(item)
+    ordered=[]
+    for group in groups.values():
+        group['candidates'].sort(key=lambda c:(-int(c.get('priority') or 0),c.get('source_file',''),c.get('source_sheet',''),c.get('source_cell','')))
+        values={round(c['value'],6) for c in group['candidates']}
+        group['conflict']=len(values)>1
+        choice=decisions.get(group['key'])
+        group['selected']=next((c for c in group['candidates'] if c['id']==choice),None) if choice else (None if group['conflict'] else group['candidates'][0])
+        group['skipped']=choice=='skip'
+        ordered.append(group)
+    ordered.sort(key=lambda g:(g['advisor_name'],g['metric'],g['line_name']))
+    selected=[g for g in ordered if g['selected']]
+    return {'period':period,'files':sources,'groups':ordered,'unresolved':list(unresolved.values()),'issues':issues,
+        'stats':{'files':len(sources),'advisors':len({g['advisor_code'] for g in selected}),'ready':len(selected),
+            'conflicts':sum(g['conflict'] and not g['selected'] and not g.get('skipped') for g in ordered),
+            'unresolved':len(unresolved),'sales_goal_usd':sum(g['selected']['value'] for g in selected if g['metric']=='sales_goal')}}
+
+
+def nx54_frame_rows(preview):
+    result=[]
+    for g in preview['groups']:
+        c=g.get('selected') or {}
+        result.append({'Código':g['advisor_code'],'Asesor':g['advisor_name'],'Meta':g['metric_label'],
+            'Unidad':g['unit'],'Valor':c.get('value'),'Estado':'Lista' if c else 'Omitida' if g.get('skipped') else 'Elegir entre valores distintos',
+            'Archivo':c.get('source_file'),'Hoja':c.get('source_sheet'),'Celda':c.get('source_cell')})
+    return result
+
+
+def nx54_save_batch(preview,files,context,replace=False,db_path=None):
+    period=context['period']
+    if preview['period']!=period:raise ValueError('La revisión pertenece a otro mes. Vuelve a leer los archivos.')
+    prepared=[];base_fields={'sales_goal','new_goal','activation_goal','collections_goal'}
+    for g in preview['groups']:
+        c=g.get('selected')
+        if c:
+            value=nx5_number(c.get('value'))
+            if value is None or value<0 or not math.isfinite(value):raise ValueError('Hay una meta inválida en la selección.')
+            prepared.append((g,c,value))
+    if not prepared:raise ValueError('No hay metas listas para guardar.')
+    path=str(db_path or DB_PATH);nx54_init(path)
+    result={'saved':0,'unchanged':0,'protected':0,'pending':preview['stats']['conflicts']+preview['stats']['unresolved']}
+    batchrows=[]
+    with nx5_connection(path) as con:
+        for source in preview['files']:
+            meta=source.get('metadata',{});sha=meta.get('sha256') or hashlib.sha256(nx5_json(source).encode()).hexdigest()
+            con.execute('INSERT OR IGNORE INTO nx54_goal_sources VALUES(?,?,?,?,?)',(sha,meta.get('filename','Cuotas'),period,nx5_json(source),nx5_now()))
+        for g,c,value in prepared:
+            code=g['advisor_code'];metric=g['metric'];key=metric+'|'+nx5_key(g.get('line_name'))
+            old=con.execute('SELECT payload FROM nx54_metric_goals WHERE period=? AND advisor_code=? AND metric_key=?',(period,code,key)).fetchone()
+            oldmetric=json.loads(old[0]) if old else None
+            baserow=con.execute('SELECT payload FROM nx5_goals WHERE period=? AND advisor_code=?',(period,code)).fetchone()
+            base=json.loads(baserow[0]) if baserow else {}
+            previous=base.get(metric) if metric in base_fields else (oldmetric or {}).get('value')
+            if previous is not None and nx5_number(previous)!=value and not replace:
+                result['protected']+=1;continue
+            payload=dict(c,metric=metric,value=value,line_name=g.get('line_name',''),advisor_code=code,
+                source_alternatives=[{k:a.get(k) for k in ['value','source_file','source_sheet','source_cell','origin']} for a in g['candidates']],
+                conflict_reviewed=bool(g['conflict']),updated_at=nx5_now())
+            if oldmetric and all(oldmetric.get(k)==payload.get(k) for k in ['metric','value','source_sha','source_cell','source_sheet','line_name']):
+                if metric not in base_fields or base.get(metric)==value:result['unchanged']+=1;continue
+            if metric in base_fields:
+                base[metric]=value
+                con.execute('INSERT INTO nx5_goals VALUES(?,?,?,?) ON CONFLICT(period,advisor_code) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at',
+                    (period,code,nx5_json(base),nx5_now()))
+            con.execute('INSERT INTO nx54_metric_goals VALUES(?,?,?,?) ON CONFLICT(period,advisor_code,metric_key) DO UPDATE SET payload=excluded.payload',
+                (period,code,key,nx5_json(payload)))
+            result['saved']+=1;batchrows.append({'advisor_code':code,'metric':metric,'line_name':g.get('line_name'),'value':value,'source_sha':c.get('source_sha'),'cell':c.get('source_cell')})
+        fingerprint=hashlib.sha256(nx5_json({'period':period,'rows':batchrows,'result':result}).encode()).hexdigest()
+        con.execute('INSERT OR IGNORE INTO nx54_goal_log VALUES(?,?,?,?)',(fingerprint,period,nx5_json(dict(result,changes=batchrows)),nx5_now()))
+    return result
+
+
+def nx54_goal_history(period,db_path=None):
+    nx54_init(db_path)
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        records=con.execute('SELECT created_at,payload FROM nx54_goal_log WHERE period=? ORDER BY created_at DESC LIMIT 12',(period,)).fetchall()
+    return [{'Fecha':when,**{k:json.loads(raw).get(k) for k in ['saved','unchanged','protected','pending']}} for when,raw in records]
+
+
+def nx54_enrich_context(context,db_path=None):
+    """Adjunta metas de otras unidades sin cambiar los resultados del seguimiento."""
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        table=con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nx54_metric_goals'").fetchone()
+        records=con.execute('SELECT payload FROM nx54_metric_goals WHERE period=?',(context['period'],)).fetchall() if table else []
+    allowed={str(a['advisor_code']) for a in context.get('advisors',[])}
+    context['quota_metrics']=[json.loads(raw) for raw, in records if str(json.loads(raw).get('advisor_code')) in allowed]
+    return context
+
+
+def nx54_line_match(line_name,advisor):
+    def tokens(s):return ''.join(sorted(re.findall(r'[A-Z0-9]+',unicodedata.normalize('NFKD',str(s or '').upper()).encode('ascii','ignore').decode())))
+    wanted=tokens(line_name)
+    matches=[]
+    for dim in ['departments','brands']:
+        found=[r for r in advisor.get(dim,[]) if r.get('name') and tokens(r['name'])==wanted]
+        if found:
+            # Una clasificación por vez: nunca sumar marca y departamento.
+            values=[nx5_number(r.get('amount')) for r in found]
+            # Una coincidencia sin importe no demuestra una venta cero.
+            amount=sum(values) if all(v is not None for v in values) else None
+            return amount,dim,found
+    return None,None,[]
+
+
+def nx54_metric_rows(context,advisor_code=None):
+    lookup={str(a['advisor_code']):a for a in context.get('advisors',[])}
+    basic={'sales_goal','new_goal','activation_goal','collections_goal'};out=[]
+    for item in context.get('quota_metrics',[]):
+        code=str(item.get('advisor_code'));metric=item.get('metric');a=lookup.get(code)
+        if not a or (advisor_code is not None and code!=str(advisor_code)) or metric in basic:continue
+        actual=None;note=''
+        if metric=='line_sales_goal':
+            actual,dim,_=nx54_line_match(item.get('line_name'),a)
+            note='Venta USD de la misma línea por '+('departamento' if dim=='departments' else 'marca')+'.' if dim else 'Grupo comercial sin equivalencia única en el PDF. La meta se conserva; resultado no disponible.'
+        elif metric=='active_clients_goal':
+            note='La planilla dice clientes activos/cartera. No se equipara automáticamente a nuevos y recuperados.'
+        elif metric=='line_count_goal':
+            note='Se necesita confirmar el criterio de activación de cada línea para calcular el logro.'
+        elif metric=='activation_rate_goal':
+            note='Cobertura de cartera de la planilla; requiere confirmar que el denominador coincida con el reporte.'
+        elif metric in {'sky_liters_goal','kr_rate_goal'}:
+            note='El seguimiento no informa un resultado comparable en esta unidad.'
+        elif metric=='visits_goal':note='Se requiere el reporte de visitas realizadas.'
+        target=item.get('value');attainment=actual/target if actual is not None and target and target>0 else None
+        out.append({'advisor_code':code,'advisor_name':a.get('name') or code,'metric_label':nx54_metric_label(metric,item.get('line_name','')),
+            'unit':item.get('unit'),'target':target,'actual':actual,'attainment':attainment,
+            'source_file':item.get('source_file'),'source_sheet':item.get('source_sheet'),'source_cell':item.get('source_cell'),
+            'note':note+(' Se eligió expresamente entre valores diferentes del Excel.' if item.get('conflict_reviewed') else '')})
+    return out
+
+
+# Carga conjunta de cuotas. Este bloque se integra en el script único de NEXUS.
+
+
+def nx54_goal_value_label(value,unit):
+    if value is None:return 'No informado'
+    try:
+        number=float(value)
+        if unit in {'proporcion','ratio','%'}:return f'{number*100:,.2f} %'
+        if unit=='USD':return f'USD {number:,.2f}'
+        return f'{number:,.0f} {unit}' if number.is_integer() else f'{number:,.2f} {unit}'
+    except (TypeError,ValueError):return str(value)
+
+
+def nx54_goal_candidate_label(candidate,unit):
+    origins={'summary':'Resumen','detail':'Ficha individual','table':'Tabla','image':'Imagen'}
+    origin=origins.get(candidate.get('origin'),candidate.get('origin') or 'Archivo')
+    source=' · '.join(str(candidate.get(k) or '') for k in ['source_file','source_sheet','source_cell'])
+    return origin+' · '+nx54_goal_value_label(candidate.get('value'),unit)+' · '+source
+
+
+def nx54_goal_issues_table(issues):
+    records=[]
+    for issue in issues or []:
+        if not isinstance(issue,dict):records.append({'Observación':str(issue)});continue
+        details=issue.get('details')
+        records.append({'Nivel':issue.get('severity') or 'Revisar','Archivo':issue.get('source_file') or issue.get('filename') or '',
+            'Hoja':issue.get('source_sheet') or issue.get('sheet') or '',
+            'Celda':issue.get('source_cell') or ', '.join(str(x) for x in issue.get('source_cells',[])),
+            'Observación':issue.get('message') or issue.get('code') or '',
+            'Detalle':json.dumps(details,ensure_ascii=False,default=str) if isinstance(details,(dict,list)) else str(details or '')})
+    if records:nx5_frame(records)
+
+
+def nx54_clear_batch_choices():
+    for key in list(st.session_state):
+        if key in {'nx54_batch_overrides','nx54_batch_decisions'} or str(key).startswith(('nx54_identity_','nx54_choice_')):
+            st.session_state.pop(key,None)
+
+
+def nx54_goal_batch_ui(context):
+    import copy
+    import hashlib
+    period=context['period']
+    st.write('Carga juntas las planillas de cuotas de los supervisores. NEXUS identifica asesores, separa metas de resultados y conserva la celda de origen.')
+    st.caption('Mes de destino: '+period+'. Los montos en dólares, los clientes, las líneas, los porcentajes y los litros se mantienen como medidas diferentes.')
+    scope_key='nx54_batch_period'
+    if st.session_state.get(scope_key)!=period:
+        nx54_clear_batch_choices()
+        for key in ['nx54_pending_batch','nx54_batch_overrides','nx54_batch_decisions','nx54_last_upload_fingerprint']:
+            st.session_state.pop(key,None)
+        st.session_state[scope_key]=period
+    uploads=st.file_uploader('Planillas de los supervisores · puedes seleccionar varios archivos',
+        type=['xlsx','xlsm','xls','csv','pdf','png','jpg','jpeg'],accept_multiple_files=True,key='nx54_goal_files')
+    uploaded=[{'name':file.name,'raw':file.getvalue()} for file in uploads or []]
+    fingerprint=hashlib.sha256(json.dumps([(r['name'],hashlib.sha256(r['raw']).hexdigest()) for r in uploaded],ensure_ascii=False).encode()).hexdigest()
+    previous=st.session_state.get('nx54_last_upload_fingerprint')
+    if previous is not None and previous!=fingerprint:
+        nx54_clear_batch_choices()
+        for key in ['nx54_pending_batch','nx54_batch_overrides','nx54_batch_decisions']:
+            st.session_state.pop(key,None)
+    st.session_state['nx54_last_upload_fingerprint']=fingerprint
+    st.session_state['nx54_uploaded_raw']=uploaded
+    a,b=st.columns(2)
+    review=a.button('Revisar archivos juntos',type='primary',key='nx54_review_uploads')
+    shared=b.button('Revisar las 5 planillas compartidas de octubre',disabled=period!='2026-10',key='nx54_review_shared')
+    if period=='2026-10':st.caption('La revisión compartida incluye los cinco Excel y la referencia de Carabobo que enviaste como imagen.')
+    else:st.caption('Las planillas compartidas corresponden a octubre de 2026. Selecciona ese mes para revisarlas; para otro período, sube sus propios archivos.')
+    if review:
+        if not uploaded:st.warning('Selecciona al menos un archivo para revisarlo.')
+        else:
+            parsed=[]
+            with st.spinner('Leyendo las planillas y sus hojas…'):
+                for file in uploaded:
+                    try:parsed.append(nx54_parse_any_file(file['raw'],file['name'],period))
+                    except Exception as exc:
+                        parsed.append({'metadata':{'filename':file['name'],'sha256':hashlib.sha256(file['raw']).hexdigest(),'period':period},
+                            'candidates':[],'actuals':[],'sheets':[],
+                            'issues':[{'severity':'error','code':'file_read_error','source_file':file['name'],'message':'No se pudo leer este archivo: '+str(exc)}]})
+            st.session_state['nx54_pending_batch']={'period':period,'files':parsed,'fingerprint':fingerprint,'origin':'uploads'}
+            nx54_clear_batch_choices()
+            st.session_state['nx54_batch_overrides']={};st.session_state['nx54_batch_decisions']={}
+    if shared:
+        parsed=copy.deepcopy(nx54_shared_goal_files())
+        shared_fingerprint=hashlib.sha256(json.dumps(parsed,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+        st.session_state['nx54_pending_batch']={'period':period,'files':parsed,'fingerprint':shared_fingerprint,'origin':'shared'}
+        nx54_clear_batch_choices()
+        st.session_state['nx54_batch_overrides']={};st.session_state['nx54_batch_decisions']={}
+    pending=st.session_state.get('nx54_pending_batch')
+    if not pending or pending.get('period')!=period:
+        st.caption('Los formatos reconocidos se preparan automáticamente. Si un diseño no se reconoce, usa el asistente de columnas o la plantilla de cuotas; una foto nueva puede requerir transcribir la tabla.')
+        return
+    files=pending['files'];token=pending['fingerprint'][:14]
+    overrides=dict(st.session_state.get('nx54_batch_overrides',{}))
+    decisions=dict(st.session_state.get('nx54_batch_decisions',{}))
+    try:preview=nx54_preview(files,context,advisor_overrides=overrides,decisions=decisions)
+    except Exception as exc:st.error('No se pudo preparar la revisión: '+str(exc));return
+    identities={str(r['advisor_code']):r for r in context.get('advisors',[]) if r.get('advisor_code') is not None}
+    unresolved=preview.get('unresolved') or []
+    references=pending.setdefault('manual_refs',{})
+    for item in unresolved:
+        if item.get('ref_key'):references[str(item['ref_key'])]=dict(item)
+    if references:
+        with st.expander(f'Confirmar referencias de asesor · {len(unresolved)} pendientes',expanded=bool(unresolved)):
+            st.write('Asigna únicamente los códigos o nombres que puedas confirmar. Las referencias pendientes no se aplican a otra persona por aproximación.')
+            changed=False
+            seen=set()
+            for item in references.values():
+                ref_key=str(item.get('ref_key') or '')
+                if not ref_key or ref_key in seen:continue
+                seen.add(ref_key)
+                title=str(item.get('advisor_ref') or item.get('advisor_name') or 'Referencia sin código')
+                if item.get('advisor_name') and item['advisor_name']!=title:title+=' · '+str(item['advisor_name'])
+                options=['']+list(identities)
+                current=overrides.get(ref_key,'')
+                if current not in options:current=''
+                widget='nx54_identity_'+token+'_'+hashlib.sha256(ref_key.encode()).hexdigest()[:16]
+                selected=st.selectbox(title,options,index=options.index(current),key=widget,
+                    format_func=lambda code:'Pendiente · no importar' if not code else nx5_label(identities[code]))
+                note=' · '.join(str(item.get(k) or '') for k in ['source_file','reason'])
+                if note:st.caption(note)
+                if selected!=overrides.get(ref_key,''):
+                    if selected:overrides[ref_key]=selected
+                    else:overrides.pop(ref_key,None)
+                    changed=True
+            if changed:
+                st.session_state['nx54_batch_overrides']=overrides
+                preview=nx54_preview(files,context,advisor_overrides=overrides,decisions=decisions)
+    conflicts=[g for g in preview.get('groups',[]) if g.get('conflict')]
+    if conflicts:
+        with st.expander(f'Diferencias entre resumen y fichas · {len(conflicts)}',expanded=True):
+            st.write('Los valores distintos se conservan como alternativas. Elige el dato que deseas aplicar; dejarlo pendiente conserva la meta que ya estaba guardada.')
+            if st.button('Usar los valores del resumen en estas diferencias',key='nx54_choose_summaries_'+token):
+                for group in conflicts:
+                    summaries=[c for c in group['candidates'] if c.get('origin')=='summary']
+                    if summaries and len({round(c['value'],6) for c in summaries})==1:
+                        decisions[group['key']]=summaries[0]['id']
+                for key in list(st.session_state):
+                    if str(key).startswith('nx54_choice_'+token):st.session_state.pop(key,None)
+                st.session_state['nx54_batch_decisions']=decisions
+                st.rerun()
+            changed=False
+            for group in conflicts:
+                group_key=str(group['key']);candidates=group.get('candidates') or []
+                by_id={str(c['id']):c for c in candidates}
+                options=['','skip']+list(by_id)
+                current=decisions.get(group_key,'')
+                if current not in options:current=''
+                label=str(group.get('advisor_name') or group.get('advisor_code') or 'Asesor')+' · '+str(group.get('metric_label') or nx54_metric_label(group.get('metric'),group.get('line_name','')))
+                widget='nx54_choice_'+token+'_'+hashlib.sha256(group_key.encode()).hexdigest()[:16]
+                def choice_label(value,items=by_id,unit=group.get('unit','')):
+                    if value=='':return 'Pendiente · revisar antes de importar'
+                    if value=='skip':return 'No importar esta meta'
+                    return nx54_goal_candidate_label(items[value],unit)
+                selected=st.selectbox(label,options,index=options.index(current),format_func=choice_label,key=widget)
+                if selected!=decisions.get(group_key,''):
+                    if selected:decisions[group_key]=selected
+                    else:decisions.pop(group_key,None)
+                    changed=True
+            if changed:
+                st.session_state['nx54_batch_decisions']=decisions
+                preview=nx54_preview(files,context,advisor_overrides=overrides,decisions=decisions)
+    stats=preview.get('stats',{})
+    a,b,c,d=st.columns(4)
+    a.metric('Archivos revisados',stats.get('files',len(files)))
+    b.metric('Asesores identificados',stats.get('advisors',0))
+    c.metric('Metas listas',stats.get('ready',0))
+    d.metric('Meta de ventas preparada',nx5_usd(stats.get('sales_goal_usd')))
+    frame=nx54_frame_rows(preview)
+    st.markdown('#### Vista previa de metas y pendientes')
+    if frame:nx5_frame(frame)
+    else:st.info('No hay metas listas para aplicar. Revisa las referencias y los formatos pendientes.')
+    st.caption('Esta importación no reemplaza ventas, cobros ni conteos de resultados del PDF. CARTERA / CLIENTES ACTIVOS se conserva como un objetivo distinto de recuperados y nuevos. Los resúmenes y las fichas no se suman.')
+    issues=preview.get('issues') or []
+    if issues:
+        with st.expander(f'Observaciones de origen · {len(issues)}'):
+            nx54_goal_issues_table(issues)
+    actuals=[row for source in files for row in source.get('actuals',[])]
+    if actuals:
+        with st.expander(f'Resultados que traían las planillas · referencia separada · {len(actuals)}'):
+            st.caption('Son cifras del Excel con su propio corte. No se usan para reemplazar el seguimiento PDF ni para completar automáticamente sus logros.')
+            nx5_frame([{'Asesor / referencia':r.get('advisor_ref'),'Indicador':nx54_metric_label(r.get('metric')),
+                'Valor declarado':r.get('value'),'Unidad':r.get('unit'),'Archivo':r.get('source_file'),'Hoja':r.get('source_sheet'),'Celda':r.get('source_cell')} for r in actuals])
+    mapper=globals().get('nx54_column_mapping_ui')
+    if mapper and pending.get('origin')=='uploads':mapper(uploaded,context)
+    replace=st.checkbox('Actualizar también las metas guardadas que sean diferentes a estas planillas.',value=False,key='nx54_replace_existing_'+token)
+    st.caption('Con la casilla desmarcada se completan metas vacías y se conservan las que ya tenías. Las metas pendientes no se escriben.')
+    if st.button('Aplicar metas revisadas',type='primary',disabled=not bool(stats.get('ready')),key='nx54_apply_goals_'+token):
+        try:
+            result=nx54_save_batch(preview,files,context,replace=replace)
+            st.session_state.pop('nx53_script_download',None)
+            st.session_state['nx5_flash']=(f'Metas guardadas: {result.get("saved",0)}; sin cambios: {result.get("unchanged",0)}; '
+                f'conservadas por tener un valor previo: {result.get("protected",0)}; pendientes: {result.get("pending",0)}.')
+            st.rerun()
+        except Exception as exc:st.error('No se aplicaron las metas: '+str(exc))
+    history=nx54_goal_history(period)
+    if history:
+        with st.expander('Importaciones de cuotas del mes'):
+            nx5_frame(history)
+
+
+def nx54_open_shared_goals():
+    import copy
+    parsed=copy.deepcopy(nx54_shared_goal_files())
+    fingerprint=hashlib.sha256(json.dumps(parsed,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+    st.session_state.update(nx5_nav='Cargar información',nx5_config_open=False,nx5_upload_tab='Metas y cuotas',nx5_goal_mode='Archivos de supervisores',
+        nx54_batch_period='2026-10',nx54_pending_batch={'period':'2026-10','files':parsed,'fingerprint':fingerprint,'origin':'shared'},
+        nx54_batch_overrides={},nx54_batch_decisions={})
+
+
+def nx54_shared_goals_notice(context):
+    if context['period']=='2026-10' and not context.get('quota_metrics'):
+        st.info('Las cinco planillas de metas que compartiste ya están incluidas. Revisa las diferencias entre resumen y fichas antes de aplicarlas.')
+        st.button('Revisar las metas compartidas',on_click=nx54_open_shared_goals,key='nx54_home_goals')
+
+
+# NEXUS 5.5 · Maestro vigente de asesores, separado de los movimientos históricos.
+# NEXUS 5.5 · Maestro vigente de asesores, separado de los movimientos históricos.
+_NX55_MASTER_B64 = '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'
+
+
+def nx55_roster_key(value):
+    import re,unicodedata
+    return re.sub(r'[^A-Z0-9]','',unicodedata.normalize('NFKD',str(value or '').upper()).encode('ascii','ignore').decode())
+
+
+def nx55_supervisor_name(value):
+    names={'JOHANAMARCANO':'Johana Marcano','JOHANNAMARCANO':'Johana Marcano','JOSEASSAL':'José Assal',
+        'JONATHANRUIZ':'Jonathan Ruiz','JORGENENMON':'Jorge Nemnom','JORGENEMNOM':'Jorge Nemnom',
+        'DANIELMARQUEZ':'Daniel Márquez','WILMERSOLANO':'Willmer Solano','WILLMERSOLANO':'Willmer Solano'}
+    return names.get(nx55_roster_key(value),str(value or '').strip())
+
+
+def nx55_master_roster():
+    import base64,zlib,json,copy
+    if not _NX55_MASTER_B64:return {'rows':[],'metadata':{},'supervisor_counts':{}}
+    return copy.deepcopy(json.loads(zlib.decompress(base64.b64decode(_NX55_MASTER_B64))))
+
+
+def nx55_init(db_path=None):
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        con.execute('CREATE TABLE IF NOT EXISTS nx55_roster_sources(period TEXT PRIMARY KEY,payload TEXT NOT NULL)')
+
+
+def nx55_validate_roster(payload):
+    import copy,hashlib,re,collections
+    result=copy.deepcopy(payload);rows=result.get('rows') or []
+    if not rows:raise ValueError('El archivo no contiene asesores identificados.')
+    if len(rows)>10000:raise ValueError('El maestro contiene demasiados asesores para esta aplicación.')
+    supervisors={nx55_roster_key(r.get('supervisor')) for r in rows if r.get('supervisor')}
+    seen_codes=set();seen_names=set();prepared=[]
+    for row in rows:
+        name=str(row.get('master_name') or row.get('name') or '').strip()
+        supervisor=nx55_supervisor_name(row.get('supervisor'))
+        if not name or not supervisor:raise ValueError('Cada asesor necesita nombre y supervisor.')
+        namekey=nx55_roster_key(name)
+        if nx55_roster_key(nx55_supervisor_name(name)) in supervisors:raise ValueError('Un supervisor figura como asesor: '+name+'. Sepáralo del listado de vendedores.')
+        if namekey in seen_names:raise ValueError('El nombre se repite en el maestro: '+name+'. Confirma su código.')
+        seen_names.add(namekey)
+        rawcode=row.get('numeric_code')
+        code=str(rawcode).strip() if rawcode is not None else ''
+        if code.endswith('.0'):code=code[:-2]
+        if code and not re.fullmatch(r'\d+',code):raise ValueError('El código A2 debe ser numérico o quedar vacío: '+name)
+        if code and code in seen_codes:raise ValueError('Un código A2 aparece en dos asesores: '+code)
+        if code:seen_codes.add(code)
+        master_id='A2-'+code if code else 'PERSON-'+hashlib.sha256(namekey.encode()).hexdigest()[:16]
+        prepared.append(dict(row,master_name=name,numeric_code=code or None,supervisor=supervisor,
+            role='advisor',active=True,master_id=master_id))
+    result['rows']=prepared
+    result['supervisor_counts']=dict(collections.Counter(r['supervisor'] for r in prepared))
+    result['total_active_advisors']=len(prepared)
+    result.setdefault('metadata',{})
+    return result
+
+
+def nx55_parse_roster(raw,filename):
+    """Lee el formato de equipos por supervisor y conserva la evidencia del código."""
+    import openpyxl,io,re,hashlib,collections
+    if len(raw)>30_000_000:raise ValueError('El maestro supera 30 MB.')
+    book=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True,keep_links=False)
+    known=nx55_master_roster().get('rows',[])
+    registry={nx55_roster_key(r['master_name']):r for r in known}
+    for r in known:
+        for ev in r.get('code_evidence',[]):
+            for k in ['name','master_name']:
+                if ev.get(k):registry.setdefault(nx55_roster_key(ev[k]),r)
+    rows=[];issues=[];printed_counts={};printed_total=None
+    try:
+        for ws in book:
+            if ws.max_row*ws.max_column>2_000_000:raise ValueError('Una hoja del maestro es demasiado grande.')
+            grid=[list(r) for r in ws.iter_rows(values_only=True)]
+            if not grid:continue
+            first=grid[0]
+            if any('NUMEROTOTALDEASESORES' in nx55_roster_key(v) for v in first):
+                for row in grid[1:]:
+                    if len(row)<2:continue
+                    label=str(row[0] or '').strip();value=row[1]
+                    if isinstance(value,(int,float)):
+                        if nx55_roster_key(label)=='TOTAL':printed_total=int(value)
+                        elif label:printed_counts[nx55_supervisor_name(label)]=int(value)
+                continue
+            owner=None;owner_cell=None;number_is_code=False
+            for rn,row in enumerate(grid,1):
+                for ci,value in enumerate(row[:12],1):
+                    match=re.search(r'SUPERVISOR\s*:\s*(.+)',str(value or ''),re.I)
+                    if match:
+                        owner=nx55_supervisor_name(match.group(1));owner_cell=openpyxl.utils.get_column_letter(ci)+str(rn)
+                        number_is_code=nx55_roster_key(row[0] if row else '') in {'COD','CODIGO','CODASESOR','CODIGOASESOR'}
+                if not owner or len(row)<2:continue
+                name_raw=str(row[1] or '').strip();ordinal=row[0]
+                if not name_raw or nx55_roster_key(name_raw) in {'NOMBRE','NOMBREASESOR','NOMBRES'} or not isinstance(ordinal,(int,float)):continue
+                if 'TOTALDEASESORES' in nx55_roster_key(name_raw):continue
+                match=re.search(r'-\s*(\d+)\s*$',name_raw)
+                code=match.group(1) if match else str(int(ordinal)) if number_is_code and ordinal==int(ordinal) else None
+                name=re.sub(r'\s*-\s*\d+\s*$','',name_raw).strip()
+                knownrow=registry.get(nx55_roster_key(name))
+                method='master_explicit_code' if code else 'missing_code'
+                evidence=[];confirmation=False
+                if code:evidence=[{'file':filename,'sheet':ws.title,'cell':'B'+str(rn),'value':name_raw}]
+                elif knownrow and knownrow.get('numeric_code'):
+                    code=knownrow['numeric_code'];method='previous_master_exact_identity'
+                    evidence=list(knownrow.get('code_evidence') or [])
+                    confirmation=bool(knownrow.get('code_needs_confirmation'))
+                else:
+                    confirmation=True;issues.append({'code':'roster_missing_code','severity':'warning','message':'Código A2 pendiente para '+name+'. No se inventa un código del sistema.'})
+                rows.append(dict(master_name=name,master_name_raw=name_raw,numeric_code=code,supervisor=owner,supervisor_raw=owner,
+                    role='advisor',active=True,source_file=filename,source_sheet=ws.title,source_cell='B'+str(rn),
+                    supervisor_source_cell=owner_cell,code_match_method=method,code_evidence=evidence,code_needs_confirmation=confirmation,
+                    source_code=(knownrow.get('source_code') or (knownrow.get('report_identity') or {}).get('advisor_code')) if knownrow and knownrow.get('numeric_code')==code else None))
+    finally:book.close()
+    result=nx55_validate_roster({'rows':rows,'metadata':{'filename':filename,'sha256':hashlib.sha256(raw).hexdigest(),'source_type':'active_advisor_master'},
+        'issues':issues,'printed_supervisor_counts':printed_counts,'printed_total':printed_total})
+    counts=result['supervisor_counts']
+    if printed_total is not None and printed_total!=len(rows):
+        result['issues'].append({'code':'roster_total_mismatch','severity':'warning','message':'El total impreso no coincide con los nombres leídos: '+str(printed_total)+' frente a '+str(len(rows))+'.'})
+    for supervisor,expected in printed_counts.items():
+        if counts.get(supervisor)!=expected:result['issues'].append({'code':'roster_team_count_mismatch','severity':'warning','message':'La cantidad de '+supervisor+' no coincide con el resumen impreso.'})
+    return result
+
+
+def nx55_save_roster(payload,period,db_path=None):
+    import re
+    if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',str(period)):raise ValueError('Selecciona un período AAAA-MM válido.')
+    checked=nx55_validate_roster(payload)
+    nx55_init(db_path)
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        con.execute('INSERT INTO nx55_roster_sources VALUES(?,?) ON CONFLICT(period) DO UPDATE SET payload=excluded.payload',(period,nx5_json(checked)))
+    return {'advisors':len(checked['rows']),'supervisors':len(checked['supervisor_counts'])}
+
+
+def nx55_selected_roster(period,db_path=None):
+    import json
+    if str(period)<'2026-10':return None
+    path=str(db_path or DB_PATH)
+    with nx5_connection(path) as con:
+        exists=con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nx55_roster_sources'").fetchone()
+        found=con.execute('SELECT payload FROM nx55_roster_sources WHERE period<=? ORDER BY period DESC LIMIT 1',(period,)).fetchone() if exists else None
+    return nx55_validate_roster(json.loads(found[0]) if found else nx55_master_roster())
+
+
+def nx55_apply_roster(context,db_path=None):
+    import copy,re,hashlib
+    master=nx55_selected_roster(context['period'],db_path)
+    if master is None:return context
+    original=list(context.get('advisors') or [])+list(context.get('excluded_advisors') or []);out=dict(context)
+    used=set();active=[];issues=[]
+    def numeric(row):
+        value=str(row.get('master_numeric_code') or row.get('numeric_code') or row.get('advisor_alias') or row.get('advisor_code') or '')
+        match=re.match(r'^(\d+)\b',value)
+        return match.group(1) if match else None
+    def issue(message,code,advisor=None,severity='warning'):
+        return {'message':message,'code':code,'advisor_code':advisor,'severity':severity}
+    for member in master['rows']:
+        number=member.get('numeric_code');master_id=member['master_id']
+        matches=[r for r in original if number and numeric(r)==number]
+        if len(matches)>1:
+            issues.append(issue('Más de un registro del reporte coincide con el código '+number+'. Se deja pendiente su resultado.','master_multiple_source_matches'))
+            matches=[]
+        if not matches and not number:
+            matches=[r for r in original if str(r.get('master_id') or '')==master_id]
+        if len(matches)==1:
+            old=matches[0];row=copy.deepcopy(old);used.add(str(old['advisor_code']));record_available=bool(old.get('record_available',True))
+            row['source_name_before_master']=old.get('name');row['source_supervisor_before_master']=old.get('supervisor')
+        else:
+            internal=str(member.get('source_code') or (member.get('report_identity') or {}).get('advisor_code') or ('ACT-'+hashlib.sha256(master_id.encode()).hexdigest()[:16]))
+            row={'advisor_code':internal,'advisor_alias':number or '', 'legacy':False,'label':member['master_name'],
+                'source_page':None,'source_filename':'','source_sha':None,'start_date':None,'end_date':None,
+                'portfolio':None,'activated_reported':None,'inactive_reported':None,'new_reported':None,
+                'sales_reported':None,'collections':None,'invoices':None,'credit_notes':None,'transactions':None,
+                'sales_goal':None,'new_goal':None,'activation_goal':None,'collections_goal':None,
+                'sales_attainment':None,'sales_gap':None,'source_issues':[],'issues':[],
+                'clients_activated':[],'clients_inactive':[],'clients_new':[],'departments':[],'brands':[],'categories':[],
+                'section_counts':{},'printed_totals':{},'actions':{}}
+            record_available=False
+        row.update(name=' '.join(member['master_name'].split()).title(),supervisor=member['supervisor'],active=True,role='advisor',
+            master_id=master_id,master_numeric_code=number,numeric_code=number,
+            master_name_raw=member['master_name'],master_supervisor_raw=member.get('supervisor_raw'),
+            master_evidence={k:member.get(k) for k in ['source_file','source_sheet','source_cell','supervisor_source_cell','code_match_method','code_evidence']},
+            master_code_needs_confirmation=bool(member.get('code_needs_confirmation')),record_available=record_available,
+            name_confirmed=True,photo_roster=False,roster_source='Maestro actualizado · '+str(master.get('metadata',{}).get('filename') or master.get('source_file') or 'Asesores activos'))
+        # The current master replaces prior vacancy/photo identity flags.
+        row.pop('vacant',None)
+        row['issues']=[i for i in row.get('issues',[]) if not isinstance(i,dict) or i.get('code') not in {'vacant_code_with_history','photo_roster_source','roster_name','roster_supervisor'}]
+        if not number:issues.append(issue('Código A2 pendiente para '+row['name']+'. Se conserva su identidad sin inventar un código A2.','master_missing_code',row['advisor_code']))
+        elif not record_available:issues.append(issue('El asesor está activo en el maestro, pero no tiene un registro de resultados identificado en este período.','master_missing_results',row['advisor_code']))
+        if member.get('code_needs_confirmation') and number:
+            issues.append(issue('Correspondencia de código '+number+' conservada con evidencia; confirmar la variante de identidad de '+row['name']+'.','master_identity_variant',row['advisor_code'],'info'))
+        active.append(row)
+    # The original PDF loop cannot hydrate newly introduced ACT- identities.
+    # Goals and commitments are keyed independently from measured results.
+    import json
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        tables={r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        goals={str(code):json.loads(raw) for code,raw in con.execute('SELECT advisor_code,payload FROM nx5_goals WHERE period=?',(context['period'],))} if 'nx5_goals' in tables else {}
+        actions={str(code):json.loads(raw) for code,raw in con.execute('SELECT advisor_code,payload FROM nx5_actions WHERE period=?',(context['period'],))} if 'nx5_actions' in tables else {}
+    for row in active:
+        goal=goals.get(str(row['advisor_code']),{})
+        for field in ['sales_goal','new_goal','activation_goal','collections_goal','allocation_pct']:
+            if field in goal:row[field]=goal[field]
+        if str(row['advisor_code']) in actions:row['actions']=actions[str(row['advisor_code'])]
+    excluded=[copy.deepcopy(r) for r in original if str(r['advisor_code']) not in used]
+    activeids={str(r['advisor_code']) for r in active}
+    stale={'vacant_code_with_history','photo_roster_source','roster_name','roster_supervisor','photo_identity_ambiguous'}
+    out['excluded_issues']=[i for i in context.get('issues',[]) if isinstance(i,dict) and i.get('advisor_code') and str(i['advisor_code']) not in activeids]
+    out['issues']=[copy.deepcopy(i) for i in context.get('issues',[]) if not isinstance(i,dict) or (i.get('code') not in stale and (not i.get('advisor_code') or str(i['advisor_code']) in activeids))]
+    out['roster_issues']=issues
+    out['issues']+=issues
+    out['advisors']=active;out['excluded_advisors']=excluded
+    out['master_roster']=master;out['master_roster_applied']=True
+    out['master_roster_version']=master.get('metadata',{}).get('sha256') or '2026-11-02-active42'
+    out['roster_scope']={'active_advisors':len(active),'with_source_results':sum(r['record_available'] for r in active),
+        'without_source_results':sum(not r['record_available'] for r in active),'excluded_source_records':len(excluded),
+        'supervisor_counts':dict(master['supervisor_counts'])}
+    out['brand_goals']=[r for r in context.get('brand_goals',[]) if str(r.get('advisor_code')) in activeids]
+    out['quota_metrics']=[r for r in context.get('quota_metrics',[]) if str(r.get('advisor_code')) in activeids]
+    return out
+
+
+def nx55_roster_upload_ui(context):
+    st.markdown('#### Equipo activo y supervisores')
+    current=context.get('master_roster') or nx55_master_roster()
+    st.caption(str(current.get('total_active_advisors',len(current.get('rows',[]))))+' asesores activos. Los supervisores no se incluyen como vendedores; sus registros originales permanecen en el control de origen.')
+    nx5_frame([{'Supervisor':name,'Asesores':count} for name,count in current.get('supervisor_counts',{}).items()])
+    file=st.file_uploader('Actualizar maestro de asesores activos · Excel',type=['xlsx','xlsm'],key='nx55_roster_file')
+    if st.button('Revisar maestro de asesores',key='nx55_review_master'):
+        if not file:st.warning('Selecciona el Excel del equipo activo.')
+        else:
+            try:st.session_state['nx55_pending_roster']={'period':context['period'],'payload':nx55_parse_roster(file.getvalue(),file.name)}
+            except Exception as exc:st.error('No se pudo leer el maestro: '+str(exc))
+    pending=st.session_state.get('nx55_pending_roster')
+    if pending and pending['period']==context['period']:
+        payload=pending['payload'];rows=payload['rows']
+        st.write('Vista previa: '+str(len(rows))+' asesores. Completa solo los códigos A2 que puedas confirmar; una celda vacía no se reemplaza por un código inventado.')
+        frame=pd.DataFrame([{'master_name':r['master_name'],'numeric_code':r.get('numeric_code') or '', 'supervisor':r['supervisor']} for r in rows])
+        edits=st.data_editor(frame,hide_index=True,width='stretch',disabled=['master_name'],
+            column_config={'master_name':'Asesor','numeric_code':'Código A2 · vacío si falta','supervisor':'Supervisor'},key='nx55_master_editor_'+payload['metadata']['sha256'][:12])
+        for it in payload.get('issues',[]):st.caption(it.get('message') or str(it))
+        if st.button('Aplicar maestro revisado a este período',type='primary',key='nx55_apply_master'):
+            try:
+                updated=dict(payload);byname={r['master_name']:r for r in rows}
+                updated['rows']=[dict(byname[r['master_name']],numeric_code=r['numeric_code'] or None,supervisor=r['supervisor']) for r in edits.to_dict('records')]
+                result=nx55_save_roster(updated,context['period'])
+                st.session_state.pop('nx55_pending_roster',None);st.session_state.pop('nx53_script_download',None)
+                st.session_state['nx5_flash']='Equipo actualizado: '+str(result['advisors'])+' asesores en '+str(result['supervisors'])+' supervisiones.'
+                st.rerun()
+            except Exception as exc:st.error(str(exc))
+
+
+# NEXUS 5.5 · Resultados declarados en las planillas de gestión.
+# No escribe en las fuentes ni reemplaza los resultados del PDF.
+def nx55_management_from_v54(parsed):
+    """Convierte tablas de resumen; las fichas quedan como evidencia alternativa."""
+    import copy,datetime,re,unicodedata
+    def key(v):return re.sub(r'[^A-Z0-9]','',unicodedata.normalize('NFKD',str(v or '').upper()).encode('ascii','ignore').decode())
+    meta=copy.deepcopy(parsed.get('metadata') or {})
+    filename=meta.get('filename','Planilla')
+    source_kind='cierre_declarado' if 'CIERRE' in key(filename) else 'cuotas_con_logros_declarados'
+    meta.update(source_kind=source_kind,source_date=meta.get('source_date'),end_date=meta.get('end_date'),cutoff_confirmed=False,
+        result_policy='Resumen declarado; blancos desconocidos; fichas como alternativas; no sustituye el PDF automáticamente.')
+    fields={'active_clients_goal':'portfolio','new_goal':'new_goal','sales_goal':'sales_goal','line_count_goal':'line_goal'}
+    actual_fields={'active_clients_goal':'activated','new_goal':'new_actual','sales_goal':'sales_actual','line_count_goal':'line_actual'}
+    rows={};issues=copy.deepcopy(parsed.get('issues') or []);detail_groups={};detail_metrics={}
+    for role,collection in [('goal',parsed.get('candidates') or []),('actual',parsed.get('actuals') or [])]:
+        for item in collection:
+            ref=str(item.get('advisor_ref') or item.get('advisor_name') or '').strip()
+            if not ref:continue
+            if item.get('origin')=='summary':
+                record=rows.setdefault(ref,{'advisor_ref':ref,'advisor_name':item.get('advisor_name') or '',
+                    'portfolio':None,'activated':None,'new_goal':None,'new_actual':None,'sales_goal':None,'sales_actual':None,
+                    'line_goal':None,'line_actual':None,'observations':'','source_file':filename,'source_sheet':item.get('source_sheet'),
+                    'source_row':None,'cell_map':{},'details':[],'variants':[],'source_date':meta.get('source_date'),'end_date':meta.get('end_date')})
+                matched=re.search(r'(\d+)$',str(item.get('source_cell') or ''))
+                if matched and record['source_row'] is None:record['source_row']=int(matched[1])
+                field=(fields if role=='goal' else actual_fields).get(item.get('metric'))
+                if not field:continue
+                previous=record.get(field);value=item.get('value')
+                if previous is not None and value is not None and previous!=value:
+                    record['variants'].append({'field':field,'value':value,'source_sheet':item.get('source_sheet'),'source_cell':item.get('source_cell')})
+                    issues.append({'severity':'warning','code':'management_summary_conflict','message':'Hay dos valores de resumen distintos para un indicador. Se conserva el primero y la alternativa.',
+                        'advisor_ref':ref,'source_file':filename,'source_sheet':item.get('source_sheet'),'details':{'field':field,'first':previous,'alternative':value}})
+                else:
+                    record[field]=value;record['cell_map'][field]=item.get('source_cell')
+            elif item.get('origin') in {'detail','table'}:
+                if item.get('metric')=='line_sales_goal':
+                    line_key=(ref,item.get('source_sheet'),key(item.get('line_name')))
+                    entry=detail_groups.setdefault(line_key,{'advisor_ref':ref,'advisor_name':item.get('advisor_name') or '',
+                        'line_name':item.get('line_name') or '', 'goal':None,'actual':None,'unit':item.get('unit') or 'USD',
+                        'source_sheet':item.get('source_sheet'),'goal_cell':None,'actual_cell':None})
+                    entry[role]=item.get('value');entry[role+'_cell']=item.get('source_cell')
+                elif item.get('metric') in fields:
+                    field=(fields if role=='goal' else actual_fields)[item['metric']]
+                    detail_metrics.setdefault(ref,[]).append({'field':field,'value':item.get('value'),'source_sheet':item.get('source_sheet'),'source_cell':item.get('source_cell')})
+    details_by_ref={}
+    for entry in detail_groups.values():details_by_ref.setdefault(entry['advisor_ref'],[]).append(entry)
+    for ref,record in rows.items():
+        record['details']=details_by_ref.get(ref,[])
+        record['variants'].extend(detail_metrics.get(ref,[]))
+        record['known_fields']=[f for f in ['portfolio','activated','new_goal','new_actual','sales_goal','sales_actual','line_goal','line_actual'] if record.get(f) is not None]
+    # Las sumas son controles y declaran expresamente su cobertura.
+    totals={}
+    metrics=[('activation','activated','portfolio'),('new','new_actual','new_goal'),('sales','sales_actual','sales_goal'),('lines','line_actual','line_goal')]
+    for label,actual,target in metrics:
+        all_rows=list(rows.values());known=[r for r in all_rows if r.get(actual) is not None]
+        compatible=[r for r in known if r.get(target) is not None and r[target]>0]
+        numerator=sum(float(r[actual]) for r in compatible);denominator=sum(float(r[target]) for r in compatible)
+        totals[label]={'records':len(all_rows),'known_actual_records':len(known),'covered_records':len(compatible),
+            'actual_known_sum':sum(float(r[actual]) for r in known),
+            'full_target_known_sum':sum(float(r[target]) for r in all_rows if r.get(target) is not None),
+            'covered_actual_sum':numerator,'covered_target_sum':denominator,
+            'weighted_ratio_covered':numerator/denominator if denominator else None,
+            'complete':bool(all_rows) and len(compatible)==len(all_rows),
+            'missing_actual_refs':[r['advisor_ref'] for r in all_rows if r.get(actual) is None]}
+    if not rows:issues.append({'severity':'warning','code':'management_summary_missing','message':'No se reconoció un resumen de gestión por asesor. No se reconstruyeron resultados sumando marcas.'})
+    return {'metadata':meta,'records':list(rows.values()),'issues':issues,'totals':totals,
+        'details_by_advisor_ref':details_by_ref,'detail_metrics_by_advisor_ref':detail_metrics}
+
+
+def nx55_parse_management_file(raw,filename,period):
+    """Lee el resumen, sus observaciones y variantes de las fichas originales."""
+    import datetime,io,re,unicodedata
+    parsed=nx54_parse_goal_file(raw,filename,period)
+    out=nx55_management_from_v54(parsed)
+    def norm(v):return re.sub(r'[^A-Z0-9]','',unicodedata.normalize('NFKD',str(v or '').upper()).encode('ascii','ignore').decode())
+    grids={}
+    if str(filename).lower().endswith(('.xlsx','.xlsm')):
+        import openpyxl
+        book=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True,keep_links=False)
+        try:
+            for ws in book:
+                if ws.max_row*ws.max_column>2_000_000:raise ValueError('La hoja de gestión es demasiado grande.')
+                grids[ws.title]=[list(r) for r in ws.iter_rows(values_only=True)]
+        finally:book.close()
+    elif str(filename).lower().endswith('.xls'):
+        import pandas as pd
+        frames=pd.read_excel(io.BytesIO(raw),sheet_name=None,header=None,dtype=object)
+        grids={str(n):f.where(pd.notna(f),None).values.tolist() for n,f in frames.items()}
+    valid_sheets={s.get('name') for s in parsed.get('sheets',[]) if isinstance(s,dict) and s.get('period_valid',True)}
+    date_values=set();cutoff_values=set()
+    for sheet,grid in grids.items():
+        if sheet not in valid_sheets:continue
+        for row in grid[:8]:
+            for index,value in enumerate(row[:30]):
+                date=None
+                if isinstance(value,(datetime.date,datetime.datetime)):date=value.date() if isinstance(value,datetime.datetime) else value
+                elif isinstance(value,str):
+                    match=re.fullmatch(r'\s*(\d{1,2})[-/](\d{1,2})[-/](\d{2}|20\d{2})\s*',value)
+                    if match:
+                        year=int(match[3]);year=2000+year if year<100 else year
+                        try:date=datetime.date(year,int(match[2]),int(match[1]))
+                        except ValueError:pass
+                if date and date.strftime('%Y-%m')==period:
+                    date_values.add(date.isoformat())
+                    left=norm(row[index-1]) if index else ''
+                    if left in {'FECHADECORTE','CORTE','AL','HASTA'}:cutoff_values.add(date.isoformat())
+    source_date=next(iter(date_values)) if len(date_values)==1 else None
+    end_date=next(iter(cutoff_values)) if len(cutoff_values)==1 else None
+    out['metadata'].update(source_date=source_date,end_date=end_date,cutoff_confirmed=bool(end_date),
+        date_evidence=sorted(date_values),cutoff_evidence=sorted(cutoff_values))
+    by_ref={r['advisor_ref']:r for r in out['records']}
+    for record in out['records']:
+        record.update(source_date=source_date,end_date=end_date)
+        sheet=record.get('source_sheet');rowno=record.get('source_row');grid=grids.get(sheet,[])
+        if rowno and rowno<=len(grid):
+            obscol=None
+            for row in grid[:30]:
+                for ci,label in enumerate(row):
+                    if norm(label).startswith('OBSERVACION'):obscol=ci;break
+                if obscol is not None:break
+            if obscol is not None and obscol<len(grid[rowno-1]):
+                value=grid[rowno-1][obscol]
+                record['observations']=str(value).strip() if value is not None else ''
+                record['cell_map']['observations']='%s%s'%(_nx55_col_name(obscol+1),rowno)
+    # Cantidades de marcas escritas dentro de rótulos (MARCAS17 / LOGRO16)
+    # son evidencia declarada, distinta de contar importes positivos o cuotas USD.
+    for sheet,grid in grids.items():
+        if sheet not in valid_sheets:continue
+        matching_refs={str(i.get('advisor_ref')) for i in parsed.get('candidates',[])+parsed.get('actuals',[]) if i.get('source_sheet')==sheet and i.get('origin')=='detail'}
+        if len(matching_refs)!=1:continue
+        ref=next(iter(matching_refs));record=by_ref.get(ref)
+        for rn,row in enumerate(grid[:30],1):
+            if len(row)<3 or not norm(row[0]).startswith('MARCAS') or norm(row[1]) not in {'META','CUOTA'}:continue
+            for field,position,pattern in [('line_goal',0,r'(\d+)'),('line_actual',2,r'(?:LOGRO|LOGR0)\s*(\d+)')]:
+                match=re.search(pattern,str(row[position] or ''),re.I)
+                if not match:continue
+                value=float(match[1]);variant={'field':field,'value':value,'source_sheet':sheet,'source_cell':_nx55_col_name(position+1)+str(rn),'raw_text':str(row[position])}
+                out['detail_metrics_by_advisor_ref'].setdefault(ref,[]).append(variant)
+                if record:
+                    record['variants'].append(variant)
+                    if record.get(field) is not None and record[field]!=value:
+                        out['issues'].append({'severity':'warning','code':'management_embedded_count_conflict','advisor_ref':ref,'source_file':filename,'source_sheet':sheet,'source_cell':variant['source_cell'],
+                            'message':'La cantidad de marcas del resumen difiere de la escrita en la ficha. Se conservan ambos valores.',
+                            'details':{'field':field,'summary':record[field],'detail':value}})
+    if not end_date:out['issues'].append({'severity':'info','code':'management_cutoff_not_printed','source_file':filename,
+        'message':'La planilla no imprime una fecha de corte inequívoca. El nombre «cierre» no se interpreta automáticamente como día31.'})
+    return out
+
+
+def _nx55_col_name(column):
+    result=''
+    while column:column,n=divmod(column-1,26);result=chr(65+n)+result
+    return result
+
+
+# NEXUS 5.5 · Resultados por supervisor y reglas del seguimiento.
+_NX55_MANAGEMENT_B64 = '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'
+_NX55_ACTIVATION_MIN = .70
+
+
+def nx55_shared_management():
+    import zlib
+    return json.loads(zlib.decompress(base64.b64decode(_NX55_MANAGEMENT_B64))) if _NX55_MANAGEMENT_B64 else []
+
+
+def nx55_results_init(db_path=None):
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        con.executescript('''
+        CREATE TABLE IF NOT EXISTS nx55_results_sources(sha TEXT PRIMARY KEY,period TEXT NOT NULL,filename TEXT NOT NULL,payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS nx55_results_active(period TEXT NOT NULL,supervisor TEXT NOT NULL,sha TEXT NOT NULL,PRIMARY KEY(period,supervisor));
+        ''')
+
+
+def nx55_numeric_code(row):
+    value=str(row.get('master_numeric_code') or row.get('numeric_code') or row.get('advisor_alias') or row.get('advisor_code') or '')
+    m=re.match(r'^(\d{3})\b',value)
+    return m[1] if m else ''
+
+
+def nx55_resolve_result(record,context):
+    ref=nx5_code(record.get('advisor_ref'));name=nx5_key(record.get('advisor_name'))
+    found=[a for a in context['advisors'] if ref and ref in {nx5_code(a['advisor_code']),nx55_numeric_code(a)}]
+    if len(found)==1:return found[0]
+    found=[a for a in context['advisors'] if name and nx5_key(a['name'])==name]
+    return found[0] if len(found)==1 else None
+
+
+def nx55_source_teams(source,context):
+    return sorted({a['supervisor'] for r in source.get('records',[]) if (a:=nx55_resolve_result(r,context))})
+
+
+def nx55_store_results(source,context,activate=True,db_path=None):
+    meta=source.get('metadata',{});period=context['period']
+    if meta.get('period')!=period:raise ValueError('La planilla corresponde a otro mes.')
+    if not source.get('records'):raise ValueError('No hay filas de seguimiento reconocidas para guardar.')
+    sha=meta.get('sha256') or hashlib.sha256(nx5_json(source).encode()).hexdigest()
+    teams=nx55_source_teams(source,context)
+    if not teams:raise ValueError('Ningún asesor de la planilla coincide con el maestro activo. Revisa los códigos.')
+    nx55_results_init(db_path)
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        con.execute('INSERT OR IGNORE INTO nx55_results_sources VALUES(?,?,?,?)',(sha,period,meta.get('filename','Seguimiento'),nx5_json(source)))
+        if activate:
+            for team in teams:con.execute('INSERT INTO nx55_results_active VALUES(?,?,?) ON CONFLICT(period,supervisor) DO UPDATE SET sha=excluded.sha',(period,team,sha))
+    return {'teams':teams,'records':len(source['records'])}
+
+
+def nx55_install_references(context,db_path=None):
+    """Los archivos compartidos son fuentes; no se suman cortes ni hojas repetidas."""
+    nx55_results_init(db_path)
+    sources=[s for s in nx55_shared_management() if s.get('metadata',{}).get('period')==context['period']]
+    for source in sources:
+        try:nx55_store_results(source,context,activate=False,db_path=db_path)
+        except ValueError:continue
+    # El cierre de Johana tiene precedencia sobre su planilla anterior de cuotas.
+    ranked=sorted(sources,key=lambda s:('CIERRE' in str(s.get('metadata',{}).get('filename','')).upper(),
+        'CIERRE MES DE OCTUBRE' in str(s.get('metadata',{}).get('filename','')).upper()))
+    defaults={}
+    for source in ranked:
+        for team in nx55_source_teams(source,context):defaults[team]=source
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        for team,source in defaults.items():
+            con.execute('INSERT OR IGNORE INTO nx55_results_active VALUES(?,?,?)',(context['period'],team,source['metadata']['sha256']))
+
+
+def nx55_selected_results(context,db_path=None):
+    with nx5_connection(str(db_path or DB_PATH)) as con:
+        rows=con.execute('SELECT a.supervisor,s.payload FROM nx55_results_active a JOIN nx55_results_sources s ON a.sha=s.sha WHERE a.period=?',(context['period'],)).fetchall()
+    return {team:json.loads(raw) for team,raw in rows}
+
+
+def nx55_photo_targets(context):
+    # Correlación por iniciales de personas del maestro, nunca por el orden SKY01–05.
+    aliases={'Z1AR':'141','Z2LM':'143','Z3AT':'117','Z4FL':'151','Z5LL':'122','INDUSTRIAL':'152'}
+    result={}
+    for source in nx54_shared_goal_files():
+        if source.get('metadata',{}).get('period')!=context['period']:continue
+        for item in source.get('candidates',[]):
+            ref=aliases.get(nx5_key(item.get('advisor_ref_raw') or item.get('advisor_ref')))
+            if not ref and str(item.get('source_sheet','')).startswith('Cuotas Carabobo'):ref=nx5_code(item.get('advisor_ref'))
+            if ref:
+                target=result.setdefault(ref,{})
+                target[item['metric']]=item['value'];target['source_file']=item['source_file']
+    return result
+
+
+def nx55_overlay_results(context,mode='planillas',db_path=None):
+    import copy
+    out=dict(context);out['advisors']=[copy.deepcopy(a) for a in context['advisors']]
+    out['result_mode']=mode;photos=nx55_photo_targets(context)
+    selected=nx55_selected_results(context,db_path)
+    source_meta={}
+    imported_metrics=[];line_targets=[]
+    for a in out['advisors']:
+        a['observations']=[];a['client_lists_source']=a.get('source_filename','')
+        number=nx55_numeric_code(a);photo=photos.get(number,{})
+        if mode=='planillas':
+            source=selected.get(a['supervisor']);rec=None
+            if source:
+                candidates=[r for r in source.get('records',[]) if (resolved:=nx55_resolve_result(r,context)) and resolved['advisor_code']==a['advisor_code']]
+                if len(candidates)==1:rec=candidates[0]
+                meta=source['metadata'];source_meta[meta['sha256']]=meta
+            # El PDF se conserva en su fuente, no se usa para rellenar huecos de un cierre distinto.
+            for k in ['portfolio','activated_reported','inactive_reported','new_reported','sales_reported','collections','invoices','credit_notes','transactions','sales_goal','new_goal','activation_goal','collections_goal','sales_attainment','sales_gap','activation_pct_reported','sales_share_reported','sales_breakdown','sales_difference']:
+                a[k]=None
+            a['pdf_source_issues']=a.get('issues',[]);a['issues']=[]
+            a['section_counts']={};a['printed_totals']={}
+            for k in ['clients_activated','clients_inactive','clients_new','brands','departments','categories']:a[k]=[]
+            a['line_goal']=a['line_actual']=None;a['management_record']=rec;a['source_page']=None
+            a['source_filename']=source['metadata']['filename'] if source else photo.get('source_file','Sin planilla de resultados')
+            a['source_sha']=source['metadata']['sha256'] if source else None
+            a['start_date']=None;a['end_date']=rec.get('end_date') if rec else None
+            if rec:
+                for sourcekey,targetkey in [('portfolio','portfolio'),('activated','activated_reported'),('new_goal','new_goal'),('new_actual','new_reported'),('sales_goal','sales_goal'),('sales_actual','sales_reported'),('line_goal','line_goal'),('line_actual','line_actual')]:a[targetkey]=rec.get(sourcekey)
+                a['management_cells']=rec.get('cell_map',{})
+                a['observations']=[rec['observations']] if rec.get('observations') else []
+                labels={'portfolio':'cartera','activated':'activados','new_goal':'meta de nuevos','new_actual':'nuevos logrados','sales_goal':'cuota USD','sales_actual':'venta USD','line_goal':'líneas asignadas','line_actual':'líneas activadas'}
+                for variant in rec.get('variants',[]):
+                    field=variant.get('field');other=nx5_number(variant.get('value'));declared=nx5_number(rec.get(field))
+                    if field in labels and other is not None and declared is not None and abs(other-declared)>.005:
+                        a['observations'].append('Diferencia en '+labels[field]+': resumen '+f'{declared:g}'+', ficha '+f'{other:g}'+'. Se conserva el resumen declarado.')
+                detail=list(rec.get('details') or [])
+                if not detail:
+                    detail=source.get('details_by_advisor_ref',{}).get(number,[])
+                a['management_details']=detail
+                a['brands']=[{'name':d['line_name'],'code':'','amount':d.get('actual'),'units':None,'source_page':None,'quota':d.get('goal')} for d in detail]
+                for d in detail:
+                    if d.get('goal') is not None:
+                        imported_metrics.append(dict(advisor_code=a['advisor_code'],metric='line_sales_goal',line_name=d['line_name'],value=d['goal'],unit='USD',source_file=a['source_filename'],source_sheet=d.get('source_sheet'),source_cell=d.get('goal_cell')))
+                        line_targets.append(dict(advisor_code=a['advisor_code'],dimension='brands',name=d['line_name'],code='',goal=d['goal']))
+                for metric,field in [('active_clients_goal','portfolio'),('line_count_goal','line_goal')]:
+                    if a.get(field) is not None:imported_metrics.append(dict(advisor_code=a['advisor_code'],metric=metric,value=a[field],unit='clientes' if field=='portfolio' else 'lineas',source_file=a['source_filename'],source_sheet=rec.get('source_sheet'),source_cell=rec.get('cell_map',{}).get(field)))
+                if rec.get('variants'):a['management_variants']=rec['variants']
+                if source.get('issues'):a['management_source_issues']=source['issues']
+            else:a['observations'].append('Sin resultado declarado para este asesor en las planillas seleccionadas.')
+        else:
+            a['management_record']=None
+            source=selected.get(a['supervisor']);record=None
+            if source:
+                matching=[r for r in source.get('records',[]) if (resolved:=nx55_resolve_result(r,context)) and resolved['advisor_code']==a['advisor_code']]
+                if len(matching)==1:record=matching[0]
+            if record:
+                for field in ['sales_goal','new_goal']:
+                    if a.get(field) is None:a[field]=record.get(field)
+            imported={m['metric']:m.get('value') for m in context.get('quota_metrics',[]) if m.get('advisor_code')==a['advisor_code'] and not m.get('line_name')}
+            a['line_goal']=imported.get('line_count_goal') if imported.get('line_count_goal') is not None else (record or {}).get('line_goal');a['line_actual']=None
+            a['observations'].append('Resultados del PDF; no contiene un conteo verificable de líneas activadas según las cuotas asignadas.')
+        if photo:
+            if mode=='planillas':
+                a['activation_goal']=photo.get('active_clients_goal') or photo.get('activation_goal')
+                for metric in ['sky_liters_goal','visits_goal','kr_rate_goal']:
+                    if photo.get(metric) is not None:imported_metrics.append(dict(advisor_code=a['advisor_code'],metric=metric,value=photo[metric],unit=_NX54_METRICS[metric][1],source_file=photo.get('source_file'),source_sheet='Cuotas Carabobo · imagen',source_cell='Referencia del maestro'))
+            a['volume_unit']='L';a['volume_goal']=photo.get('sky_liters_goal');a['volume_actual']=None
+            a['photo_targets']=photo
+            a['observations'].append('Cuota SKY en litros. Falta el volumen logrado en litros; no se convierte desde USD.')
+        else:
+            a['volume_unit']='USD';a['volume_goal']=a.get('sales_goal');a['volume_actual']=a.get('sales_reported')
+        if a.get('sales_reported') is not None and a.get('sales_goal') and a['sales_goal']>0:
+            a['sales_attainment']=a['sales_reported']/a['sales_goal'];a['sales_gap']=max(0,a['sales_goal']-a['sales_reported'])
+        a['source_cutoff']=a.get('end_date')
+    if mode=='planillas':
+        out['sources']=list(source_meta.values())
+        out['source']={'filename':'; '.join(m['filename'] for m in source_meta.values()) or 'Sin planillas de resultados'}
+        out['start_date']=None;out['end_date']=None
+        out['quota_metrics']=imported_metrics;out['brand_goals']=line_targets
+        # Los controles del PDF original siguen disponibles en el alcance de origen.
+        out['pdf_source_issues']=context.get('issues',[])
+        out['issues']=[i for i in context.get('roster_issues',[])]+[nx5_issue('Los resultados de las planillas pueden estar incompletos y no imprimen un corte final confirmado. Los blancos se mantienen como N/D.','management_partial',severity='warning')]
+        seen=set()
+        for source in selected.values():
+            sha=source['metadata']['sha256']
+            if sha in seen:continue
+            seen.add(sha)
+            for original in source.get('issues',[]):
+                issue=dict(original)
+                detail=issue.get('details') or {}
+                reference=detail.get('advisor_ref') if isinstance(detail,dict) else None
+                resolved=nx55_resolve_result({'advisor_ref':reference},context) if reference else None
+                if resolved:issue['advisor_code']=resolved['advisor_code']
+                issue['message']=source['metadata']['filename']+' · '+str(issue.get('source_sheet') or '')+': '+str(issue.get('message') or issue.get('code'))
+                out['issues'].append(issue)
+        out['report_state']='AVANCE INCOMPLETO · resultados declarados; corte final no confirmado'
+    else:
+        out['report_state']='SEGUIMIENTO PDF · corte '+str(context.get('end_date') or 'no informado')
+    return out
+
+
+def nx55_ratio(actual,target):
+    return actual/target if actual is not None and target is not None and target>0 else None
+
+
+def nx55_report_rows(context):
+    out=[]
+    for a in context['advisors']:
+        portfolio=nx5_number(a.get('portfolio'));activated=nx5_number(a.get('activated_reported'))
+        ratio=nx55_ratio(activated,portfolio)
+        status='N/D' if ratio is None else 'Cumple' if ratio>=_NX55_ACTIVATION_MIN else 'Por debajo'
+        notes=list(a.get('observations') or [])
+        if ratio is not None and (activated<0 or activated>portfolio):status='Revisar';notes.append('Activados fuera del rango de la cartera declarada.')
+        elif ratio is not None and ratio<_NX55_ACTIVATION_MIN:notes.append('Activación por debajo de 70 %; faltan '+str(max(0,math.ceil(portfolio*_NX55_ACTIVATION_MIN)-int(activated)))+' clientes para el mínimo.')
+        newgoal=nx5_number(a.get('new_goal'));newactual=nx5_number(a.get('new_reported'))
+        salesgoal=nx5_number(a.get('sales_goal'));salesactual=nx5_number(a.get('sales_reported'))
+        linegoal=nx5_number(a.get('line_goal'));lineactual=nx5_number(a.get('line_actual'))
+        assigned=[d for d in a.get('management_details',[]) if nx5_number(d.get('goal')) is not None and d['goal']>0]
+        if assigned and all(nx5_number(d.get('actual')) is not None for d in assigned):
+            active=sum(d['actual']>0 for d in assigned)
+            achieved=sum(d['actual']>=d['goal'] for d in assigned)
+            if lineactual is not None and active!=lineactual:
+                notes.append('El resumen declara '+f'{lineactual:g}'+' líneas activadas; el detalle registra '+str(active)+' asignadas con venta positiva. Revisar diferencia.')
+            notes.append('Detalle: '+str(active)+'/'+str(len(assigned))+' líneas asignadas con venta positiva; '+str(achieved)+' alcanzan su cuota USD. Son indicadores distintos.')
+        if linegoal is not None and lineactual is not None and lineactual<linegoal:notes.append('Faltan '+f'{linegoal-lineactual:g}'+' líneas por activar de las asignadas.')
+        if newgoal is not None and newactual is not None and newactual<newgoal:notes.append('Faltan '+f'{newgoal-newactual:g}'+' clientes nuevos para la meta.')
+        if salesgoal is not None and salesactual is not None and salesactual<salesgoal:notes.append('Brecha de venta USD '+f'{salesgoal-salesactual:,.2f}'+'.')
+        if not a.get('management_record') and context.get('result_mode')=='planillas':notes.append('Se requiere su cierre o avance de resultados.')
+        volumeunit=a.get('volume_unit','USD');volumegoal=nx5_number(a.get('volume_goal'));volumeactual=nx5_number(a.get('volume_actual'))
+        out.append(dict(advisor_code=a['advisor_code'],numeric_code=nx55_numeric_code(a),advisor_name=a['name'],supervisor=a['supervisor'],
+            portfolio=portfolio,activated=activated,activation_pct=ratio,activation_status=status,activation_min=.7,
+            new_goal=newgoal,new_actual=newactual,new_pct=nx55_ratio(newactual,newgoal),sales_goal=salesgoal,sales_actual=salesactual,sales_pct=nx55_ratio(salesactual,salesgoal),
+            volume_unit=volumeunit,volume_goal=volumegoal,volume_actual=volumeactual,volume_pct=nx55_ratio(volumeactual,volumegoal),
+            line_goal=linegoal,line_actual=lineactual,line_pct=nx55_ratio(lineactual,linegoal),
+            observations=list(dict.fromkeys(notes)),source_label=a.get('source_filename') or 'No informado',source_cutoff=a.get('source_cutoff') or a.get('end_date'),
+            source_cells=a.get('management_cells',{}),details=a.get('management_details',[]),variants=a.get('management_variants',[])))
+    return out
+
+
+def nx55_supervisor_rows(context):
+    rows=nx55_report_rows(context);out=[]
+    for team in dict.fromkeys(r['supervisor'] for r in rows):
+        members=[r for r in rows if r['supervisor']==team];n=len(members)
+        result={'supervisor':team,'advisors':n,'observations':[]}
+        def known(field):
+            values=[r[field] for r in members if r.get(field) is not None]
+            return sum(values) if values else None
+        for prefix,target,actual in [('activation','portfolio','activated'),('new','new_goal','new_actual'),('sales','sales_goal','sales_actual'),('line','line_goal','line_actual'),('volume','volume_goal','volume_actual')]:
+            paired=[r for r in members if r.get(target) is not None and r.get(actual) is not None]
+            targetvalues=[r[target] for r in members if r.get(target) is not None]
+            actualvalues=[r[actual] for r in members if r.get(actual) is not None]
+            targetsum=sum(targetvalues) if targetvalues else None;actualsum=sum(actualvalues) if actualvalues else None
+            result[target]=targetsum if len(targetvalues)==n else None
+            result[actual]=actualsum if len(actualvalues)==n else None
+            result[target+'_known']=targetsum;result[actual+'_known']=actualsum
+            result[prefix+'_coverage']=len(paired)
+            partialratio=nx55_ratio(sum(r[actual] for r in paired),sum(r[target] for r in paired)) if paired else None
+            result[prefix+'_pct_known']=partialratio
+            result[prefix+'_pct']=partialratio if len(paired)==n else None
+            if len(paired)<n:
+                desc={'activation':'Activación','new':'Nuevos','sales':'Ventas USD','line':'Líneas','volume':'Volumen'}[prefix]
+                if prefix not in {'sales'} or all(r.get('volume_unit')=='USD' for r in members):
+                    result['observations'].append(desc+': datos comparables '+str(len(paired))+'/'+str(n)+(' · avance parcial '+f'{partialratio*100:.1f} %' if partialratio is not None else '')+'.')
+        units={r['volume_unit'] for r in members}
+        result['volume_unit']=next(iter(units)) if len(units)==1 else 'mixto'
+        if len(units)>1:result['volume_goal']=result['volume_actual']=result['volume_pct']=None
+        result['coverage_label']=str(result['activation_coverage'])+'/'+str(n)+' con activación; '+str(result['volume_coverage'])+'/'+str(n)+' con volumen comparable'
+        result['observations']=['Cobertura de datos: activación '+str(result['activation_coverage'])+'/'+str(n)+', nuevos '+str(result['new_coverage'])+'/'+str(n)+', volumen '+str(result['volume_coverage'])+'/'+str(n)+', líneas '+str(result['line_coverage'])+'/'+str(n)+'.'] if any(result[k+'_coverage']<n for k in ['activation','new','volume','line']) else []
+        result['activation_status']='Revisar' if any(r['activation_status']=='Revisar' for r in members) else 'N/D' if result['activation_pct'] is None else 'Cumple' if result['activation_pct']>=.7 else 'Por debajo'
+        notes=[s for r in members for s in r.get('observations',[])]
+        result['observations']+=list(dict.fromkeys(notes))
+        out.append(result)
+    return out
+
+
+def nx55_management_ui(context):
+    st.markdown('#### Cierres y avances de supervisores')
+    st.write('Sube los avances semanales o cierres mensuales juntos. Revisa las variables detectadas y pulsa «Usar estas planillas como resultados». Cada supervisor conserva una fuente activa; los cortes guardados en Informes mantienen su historial.')
+    st.caption('Se reconocen las planillas de seguimiento, cuotas y el PDF del programa en sus áreas correspondientes. Si cambia el formato, la revisión mostrará qué campos faltan antes de usarlo.')
+    files=st.file_uploader('Excel de cierres o avances',type=['xlsx','xlsm','xls','csv','pdf'],accept_multiple_files=True,key='nx55_management_files')
+    if st.button('Revisar cierres y avances',key='nx55_read_management'):
+        parsed=[]
+        for file in files or []:
+            try:parsed.append(nx55_parse_management_file(file.getvalue(),file.name,context['period']))
+            except Exception as exc:st.error(file.name+': '+str(exc))
+        st.session_state['nx55_pending_management']={'period':context['period'],'sources':parsed}
+    pending=st.session_state.get('nx55_pending_management')
+    if pending and pending['period']==context['period']:
+        sources=pending['sources']
+        for s in sources:
+            st.caption(s['metadata']['filename'])
+            nx5_frame([{'Referencia':r['advisor_ref'],'Asesor':r['advisor_name'],'Cartera':r.get('portfolio'),'Activados':r.get('activated'),'Nuevos':r.get('new_actual'),'Venta USD':r.get('sales_actual'),'Líneas':r.get('line_actual')} for r in s['records']])
+            if s.get('issues'):
+                with st.expander('Observaciones de origen · '+s['metadata']['filename']):nx54_goal_issues_table(s['issues'])
+        choices={};by_team={}
+        for source in sources:
+            for team in nx55_source_teams(source,context):by_team.setdefault(team,[]).append(source)
+        for team,alternatives in by_team.items():
+            unique={s['metadata']['sha256']:s for s in alternatives}
+            if len(unique)==1:choices[team]=next(iter(unique));continue
+            order=sorted(unique,key=lambda sha:('CIERRE' not in unique[sha]['metadata']['filename'].upper(),unique[sha]['metadata']['filename']))
+            choices[team]=st.selectbox('Fuente que se usará para '+team,order,format_func=lambda sha:unique[sha]['metadata']['filename'],key='nx55_source_choice_'+nx5_key(team))
+        if by_team and st.button('Usar estas planillas como resultados',type='primary',key='nx55_apply_management'):
+            count=0
+            for source in sources:
+                if nx55_source_teams(source,context):nx55_store_results(source,context,activate=False);count+=1
+            with nx5_connection(str(DB_PATH)) as con:
+                for team,sha in choices.items():con.execute('INSERT INTO nx55_results_active VALUES(?,?,?) ON CONFLICT(period,supervisor) DO UPDATE SET sha=excluded.sha',(context['period'],team,sha))
+            st.session_state.pop('nx53_script_download',None)
+            st.session_state['nx5_flash']=str(count)+' fuentes de resultados actualizadas. Los valores vacíos se conservan como N/D.'
+            st.rerun()
+    selected=nx55_selected_results(context)
+    nx5_frame([{'Supervisor':team,'Fuente activa':s['metadata']['filename'],'Corte confirmado':s['metadata'].get('end_date') or 'No informado','Filas en la fuente':len(s['records'])} for team,s in selected.items()])
+    with st.expander('Cambiar una fuente de resultados guardada'):
+        with nx5_connection(str(DB_PATH)) as con:stored=con.execute('SELECT sha,filename,payload FROM nx55_results_sources WHERE period=?',(context['period'],)).fetchall()
+        if stored:
+            lookup={sha:json.loads(raw) for sha,name,raw in stored}
+            sha=st.selectbox('Planilla',list(lookup),format_func=lambda k:lookup[k]['metadata']['filename'],key='nx55_saved_management')
+            if st.button('Activar esta fuente para sus equipos',key='nx55_activate_saved'):
+                nx55_store_results(lookup[sha],context);st.rerun()
+
+
+def nx55_scope_notice(context):
+    scope=context.get('roster_scope') or {}
+    if scope:
+        st.caption(str(scope.get('active_advisors'))+' asesores activos · '+str(len(scope.get('supervisor_counts',{})))+' supervisores · Activación mínima de cartera: 70 % · Líneas asignadas: 100 %.')
+    if context.get('result_mode')=='planillas':
+        rows=nx55_report_rows(context);known=sum(r['sales_actual'] is not None for r in rows)
+        st.info('Resultados declarados de las planillas seleccionadas. '+str(known)+' de '+str(len(rows))+' asesores tienen venta USD informada. Los blancos son N/D; no hay un cierre final confirmado para todas las sedes.')
+    else:
+        st.caption('Resultados del PDF por código, limitados al maestro activo. El cambio de nombres/equipos no altera los documentos originales.')
+    with st.expander('Control del alcance y registros fuera del equipo activo'):
+        excluded=context.get('excluded_advisors',[])
+        if excluded:
+            nx5_frame([{'Código':r['advisor_code'],'Nombre fuente':r.get('name') or r.get('label'),'Venta USD fuente':r.get('sales_reported'),'Archivo':r.get('source_filename')} for r in excluded])
+            st.caption('Estos registros conservan su historial, pero no se incluyen como asesores activos ni en sus resultados de supervisión.')
+        for issue in context.get('roster_issues',[]):st.caption(issue.get('message',''))
+
+
+# NEXUS 5.5 · Informes cortos de resultados para dirección y supervisores.
+
+
+def nx55_compact_number(value):
+    import math
+    if isinstance(value,bool) or value is None:return None
+    try:
+        number=float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError,ValueError):return None
+
+
+def nx55_compact_text(value):
+    return '' if value is None else str(value)
+
+
+def nx55_compact_observations(value):
+    if isinstance(value,(list,tuple,set)):
+        values=[str(v).strip() for v in value if v is not None and str(v).strip()]
+    else:values=[str(value).strip()] if value is not None and str(value).strip() else []
+    return list(dict.fromkeys(values))
+
+
+def nx55_compact_data(context):
+    reader=globals().get('nx55_report_rows');group_reader=globals().get('nx55_supervisor_rows')
+    if not reader or not group_reader:raise ValueError('No está disponible el motor de resultados del equipo actualizado.')
+    rows=list(reader(context));groups=list(group_reader(context))
+    allowed={str(r.get('advisor_code')) for r in context.get('advisors',[]) if r.get('advisor_code') is not None}
+    if allowed:rows=[r for r in rows if str(r.get('advisor_code')) in allowed]
+    supervisors={str(r.get('supervisor') or 'Por asignar') for r in rows}
+    groups=[r for r in groups if str(r.get('supervisor') or 'Por asignar') in supervisors]
+    return rows,groups
+
+
+
+def nx55_compact_volume(row):
+    return {'unit':row.get('volume_unit') or 'USD',
+        'goal':row.get('volume_goal') if 'volume_goal' in row else row.get('sales_goal'),
+        'actual':row.get('volume_actual') if 'volume_actual' in row else row.get('sales_actual'),
+        'pct':row.get('volume_pct') if 'volume_pct' in row else row.get('sales_pct'),
+        'goal_known':row.get('volume_goal_known') if 'volume_goal_known' in row else row.get('sales_goal_known'),
+        'actual_known':row.get('volume_actual_known') if 'volume_actual_known' in row else row.get('sales_actual_known'),
+        'pct_known':row.get('volume_pct_known') if 'volume_pct_known' in row else row.get('sales_pct_known')}
+
+
+def nx55_compact_display_code(row):
+    numeric=row.get('numeric_code')
+    if numeric is not None and str(numeric).strip():return str(numeric)
+    code=str(row.get('advisor_code') or '')
+    return 'Pendiente' if not code or code.startswith('ACT-') else code
+
+def nx55_pdf_compact_chart(items,title,width=360,height=108,percent=False,threshold=None):
+    from reportlab.graphics.shapes import Drawing,Rect,Line,String
+    from reportlab.lib.colors import HexColor
+    pairs=[(str(label),nx55_compact_number(value)) for label,value in items]
+    pairs=[(label,value) for label,value in pairs if value is not None]
+    d=Drawing(width,height);navy=HexColor('#15374D');gray=HexColor('#607D8B');teal=HexColor('#008B91');red=HexColor('#B84B45')
+    d.add(String(0,height-12,title,fontName='Helvetica-Bold',fontSize=9,fillColor=navy))
+    if not pairs:
+        d.add(String(0,height/2,'N/D: no hay resultados comparables.',fontName='Helvetica',fontSize=8,fillColor=gray));return d
+    left=min(125,width*.34);right=width-57;top=height-31;bottom=8
+    low=min([0]+[v for _,v in pairs]);high=max([1 if percent else 0]+[v for _,v in pairs]+([threshold] if threshold is not None else []))
+    span=high-low or 1;scale=(right-left)/span;zero=left-low*scale
+    d.add(Line(zero,bottom,zero,top+7,strokeColor=HexColor('#D8E5EA'),strokeWidth=.6))
+    if threshold is not None:
+        x=left+(threshold-low)*scale
+        d.add(Line(x,bottom,x,top+5,strokeColor=HexColor('#DCB363'),strokeWidth=.7,strokeDashArray=[2,2]))
+    row_height=min(16,(top-bottom)/max(1,len(pairs)))
+    for i,(label,value) in enumerate(pairs):
+        y=top-i*row_height
+        label=label if len(label)<=24 else label[:23]+'…'
+        d.add(String(0,y,label,fontName='Helvetica',fontSize=8,fillColor=navy))
+        color=red if value<0 or (threshold is not None and value<threshold) else teal
+        d.add(Rect(zero+min(value,0)*scale,y-2,max(.65,abs(value)*scale),6,fillColor=color,strokeColor=None))
+        text=f'{value:.1%}' if percent else ('$'+f'{value/1000:,.1f}k' if abs(value)>=1000 else '$'+f'{value:,.0f}')
+        d.add(String(width-1,y,text,fontName='Helvetica',fontSize=8,fillColor=navy,textAnchor='end'))
+    return d
+
+
+def nx55_export_compact_pdf(context,level='resumido'):
+    """Dirección: panorama y todos los asesores; mediano: una ficha por equipo."""
+    import io,math
+    from xml.sax.saxutils import escape
+    from datetime import datetime
+    from reportlab.lib import colors as C
+    from reportlab.lib.pagesizes import A4,landscape
+    from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,PageBreak,KeepTogether
+    if level not in {'resumido','mediano'}:raise ValueError('Elige resumido o mediano.')
+    rows,groups=nx55_compact_data(context);output=io.BytesIO()
+    W,H=landscape(A4);M=32;U=W-2*M;navy=C.HexColor('#12384D');teal=C.HexColor('#007F87');gray=C.HexColor('#637E8A');pale=C.HexColor('#EDF5F8');line=C.HexColor('#D7E4EA');red=C.HexColor('#AC4640')
+    styles=getSampleStyleSheet()
+    for name,kw in {
+        'N55Title':dict(fontSize=20,leading=24,fontName='Helvetica-Bold',textColor=navy,spaceAfter=6),
+        'N55H1':dict(fontSize=13,leading=16,fontName='Helvetica-Bold',textColor=navy,spaceBefore=8,spaceAfter=5,keepWithNext=True),
+        'N55Body':dict(fontSize=9,leading=11.5,fontName='Helvetica',textColor=navy,spaceAfter=5),
+        'N55Small':dict(fontSize=8,leading=10,fontName='Helvetica',textColor=gray,spaceAfter=4),
+        'N55Cell':dict(fontSize=8.3,leading=10,fontName='Helvetica',textColor=navy),
+        'N55CellTight':dict(fontSize=8,leading=9.5,fontName='Helvetica',textColor=navy),
+        'N55Head':dict(fontSize=8.3,leading=10,fontName='Helvetica-Bold',textColor=C.white),
+    }.items():styles.add(ParagraphStyle(name=name,**kw))
+    def p(value,style='N55Body',markup=False):
+        text=nx55_compact_text(value)
+        return Paragraph(text if markup else escape(text),styles[style])
+    def num(value):
+        v=nx55_compact_number(value)
+        return 'N/D' if v is None else f'{v:,.0f}' if v==int(v) else f'{v:,.2f}'
+    def money(value):
+        v=nx55_compact_number(value)
+        return 'N/D' if v is None else '$'+f'{v:,.2f}'
+    def percent(value):
+        v=nx55_compact_number(value)
+        return 'N/D' if v is None else f'{v:.1%}'
+    def shown(row,key,fmt):
+        value=row.get(key)
+        if nx55_compact_number(value) is not None:return fmt(value)
+        known=row.get(key+'_known')
+        return fmt(known)+'*' if nx55_compact_number(known) is not None else 'N/D'
+    def metric(row,actual,target,ratio,money_value=False,one_line=False,threshold=None):
+        fmt=money if money_value else num
+        a=shown(row,actual,fmt);g=shown(row,target,fmt);pct=percent(row.get(ratio))
+        color='#637E8A' if nx55_compact_number(row.get(ratio)) is None else '#AC4640' if threshold is not None and nx55_compact_number(row.get(ratio))<threshold else '#12384D'
+        separator=' · ' if one_line else '<br/>'
+        ah='<font color="#637E8A">N/D</font>' if a=='N/D' else escape(a)
+        gh='<font color="#637E8A">N/D</font>' if g=='N/D' else escape(g)
+        return p('<b>'+ah+'</b> / '+gh+separator+'<font color="'+color+'">'+escape(pct)+'</font>','N55CellTight',True)
+    def volume_metric(row,one_line=False):
+        v=nx55_compact_volume(row);data={'a':v['actual'],'g':v['goal'],'p':v['pct'],'a_known':v['actual_known'],'g_known':v['goal_known']}
+        cell=metric(data,'a','g','p',v['unit']=='USD',one_line)
+        if v['unit']!='USD':
+            separator=' · ' if one_line else '<br/>'
+            cell=p('<b>'+escape(shown(data,'a',num))+'</b> / '+escape(shown(data,'g',num))+' '+escape(v['unit'])+separator+escape(percent(v['pct'])),'N55CellTight',True)
+        return cell
+    def table(data,widths,head=True):
+        converted=[]
+        for ri,row in enumerate(data):
+            converted.append([v if isinstance(v,Paragraph) else p(v,'N55Head' if ri==0 and head else 'N55Cell') for v in row])
+        t=Table(converted,colWidths=widths,repeatRows=1 if head else 0,hAlign='LEFT')
+        commands=[('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),6),('RIGHTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3),('LINEBELOW',(0,0),(-1,-1),.35,line)]
+        if head:commands.extend([('BACKGROUND',(0,0),(-1,0),navy),('ROWBACKGROUNDS',(0,1),(-1,-1),[C.white,pale])])
+        t.setStyle(TableStyle(commands));return t
+    period=str(context.get('period') or 'Período no informado');generated=str(context.get('generated_at') or datetime.now().isoformat(timespec='minutes'))
+    reporting=context.get('reporting') or {}
+    delivery_label=str(reporting.get('label') or '')
+    cutoff=str(reporting.get('cutoff') or '')
+    try:cutoff_display=datetime.fromisoformat(cutoff).strftime('%d/%m/%Y') if cutoff else ''
+    except ValueError:cutoff_display=cutoff
+    delivery_note=str(reporting.get('note') or '')
+    label=delivery_label.upper() if delivery_label else ('RESUMEN PARA DIRECCIÓN' if level=='resumido' else 'SEGUIMIENTO POR SUPERVISOR')
+    def header(canvas,doc):
+        canvas.saveState();canvas.setFillColor(navy);canvas.rect(0,H-54,W,54,stroke=0,fill=1)
+        canvas.setFillColor(C.white);canvas.setFont('Helvetica-Bold',12);canvas.drawString(M,H-24,'NEXUS COMERCIAL')
+        canvas.setFont('Helvetica',8);canvas.drawString(M,H-40,label)
+        canvas.drawRightString(W-M,H-24,period);canvas.drawRightString(W-M,H-40,('CORTE '+cutoff_display) if cutoff_display else 'EQUIPO ACTIVO')
+        canvas.setFillColor(gray);canvas.setFont('Helvetica',7.5);canvas.drawString(M,21,'Generado '+generated[:25]+' · '+label)
+        canvas.drawRightString(W-M,21,str(doc.page));canvas.restoreState()
+    doc=SimpleDocTemplate(output,pagesize=(W,H),leftMargin=M,rightMargin=M,topMargin=68,bottomMargin=34,
+        title='NEXUS - '+label+(' - '+cutoff_display if cutoff_display else ''),author='Makropetrol',subject=delivery_note,pageCompression=1)
+    story=[p('Resultados del equipo comercial','N55Title'),p(period+' · '+str(len(rows))+' asesores · '+str(len(groups))+' supervisores','N55Small'),
+        p((context.get('report_state') or 'Estado del corte según las fuentes seleccionadas.')+(' '+delivery_note if delivery_note and delivery_note not in str(context.get('report_state') or '') else ''),'N55Small'),
+        p('Reglas: activación de cartera ≥ 70 %; activación de todas las líneas asignadas = 100 %. Las cuotas en litros se mantienen separadas de las ventas en USD.','N55Small')]
+    heads=['Supervisor','Activados / cartera\nMeta ≥ 70 %','Nuevos / meta','Volumen / cuota','Líneas / asignadas\nMeta 100 %','Cobertura / corte']
+    data=[heads]
+    for g in groups:
+        coverage=str(g.get('coverage_label') or '')
+        cut=str(g.get('source_cutoff') or 'Corte no informado')
+        data.append([g.get('supervisor') or 'Por asignar',metric(g,'activated','portfolio','activation_pct'),metric(g,'new_actual','new_goal','new_pct'),
+            volume_metric(g),metric(g,'line_actual','line_goal','line_pct'),p(escape(coverage)+'<br/>'+escape(cut),'N55CellTight',True)])
+    story.append(table(data,[U*.19,U*.145,U*.13,U*.20,U*.145,U*.19]))
+    story.append(Spacer(1,6))
+    def graph_value(group,metric,volume=False):
+        values=nx55_compact_volume(group) if volume else group
+        full=values.get('pct') if volume else group.get(metric)
+        known=values.get('pct_known') if volume else group.get(metric+'_known')
+        partial=nx55_compact_number(full) is None
+        return str(group.get('supervisor'))+(' (parcial)' if partial and nx55_compact_number(known) is not None else ''),known if partial else full
+    charts=[nx55_pdf_compact_chart([graph_value(g,'activation_pct') for g in groups],'Activación conocida · parcial donde se indica',U/2-12,96,True,.70),
+        nx55_pdf_compact_chart([graph_value(g,'volume_pct',True) for g in groups if nx55_compact_volume(g)['unit']=='USD'],'Avance USD conocido · parcial donde se indica',U/2-12,96,True,1.)]
+    ct=Table([charts],colWidths=[U/2,U/2],hAlign='LEFT');ct.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),12)]));story.append(ct)
+    notes=[]
+    for g in groups:
+        notes.extend(str(g.get('supervisor') or 'Equipo')+': '+v for v in nx55_compact_observations(g.get('observations')))
+    notes=list(dict.fromkeys(notes))
+    priority_limit=2 if level=='resumido' else 3
+    priority=[v if len(v)<=180 else v[:177]+'…' for v in notes[:priority_limit]]
+    if priority:story.append(p('Observaciones prioritarias: '+' | '.join(priority)+(' | Más observaciones en el informe completo.' if len(notes)>priority_limit or any(len(v)>180 for v in notes[:priority_limit]) else ''),'N55Small'))
+    non_usd=[g for g in groups if nx55_compact_volume(g)['unit']!='USD']
+    if non_usd:
+        story.append(p('Volumen separado: '+' | '.join(str(g.get('supervisor'))+' · cuota '+num(nx55_compact_volume(g)['goal'])+' '+str(nx55_compact_volume(g)['unit'])+'; logro '+num(nx55_compact_volume(g)['actual']) for g in non_usd),'N55Small'))
+    story.append(p('* Suma parcial: faltan datos; no es una evaluación definitiva. N/D = dato no disponible/comparable. Las gráficas parciales usan solamente filas con logro y base disponibles; no son promedios simples.','N55Small'))
+    groups_by_name={str(g.get('supervisor') or 'Por asignar'):g for g in groups}
+    names=list(groups_by_name)
+    for name in sorted({str(r.get('supervisor') or 'Por asignar') for r in rows}):
+        if name not in names:names.append(name)
+    if names:story.append(PageBreak())
+    if level=='resumido':
+        story.append(p('Resultados de todos los asesores','N55H1'))
+        story.append(p('Cada celda indica logro / meta o cartera y porcentaje. Activación ≥ 70 %; líneas asignadas = 100 %.','N55Small'))
+        order={name:index for index,name in enumerate(names)}
+        ordered=sorted(rows,key=lambda r:(order.get(str(r.get('supervisor') or 'Por asignar'),999),str(r.get('advisor_name') or '')))
+        data=[['Asesor · código','Supervisor','Activados / cartera · %','Nuevos / meta · %','Volumen / cuota · %','Líneas / meta · %','Corte']]
+        for row in ordered:
+            identity=escape(str(row.get('advisor_name') or 'Nombre pendiente'))+' <font size="7.5" color="#637E8A">('+escape(nx55_compact_display_code(row))+')</font>'
+            data.append([p(identity,'N55CellTight',True),p(row.get('supervisor') or 'Por asignar','N55CellTight'),
+                metric(row,'activated','portfolio','activation_pct',one_line=True,threshold=.70),
+                metric(row,'new_actual','new_goal','new_pct',one_line=True),volume_metric(row,True),
+                metric(row,'line_actual','line_goal','line_pct',one_line=True,threshold=1.),p(row.get('source_cutoff') or 'No informado','N55CellTight')])
+        t=table(data,[U*.24,U*.15,U*.12,U*.10,U*.20,U*.10,U*.09])
+        t.setStyle(TableStyle([('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+        story.append(t)
+        source_legend=[]
+        for name in names:
+            sources=list(dict.fromkeys(str(r.get('source_label') or 'Fuente no informada') for r in rows if str(r.get('supervisor') or 'Por asignar')==name))
+            source_legend.append(name+': '+' / '.join(sources))
+        if source_legend:story.append(p('Fuentes: '+' | '.join(source_legend),'N55Small'))
+        doc.build(story,onFirstPage=header,onLaterPages=header)
+        return output.getvalue()
+    for gi,name in enumerate(names):
+        if level=='mediano' and gi:story.append(PageBreak())
+        rs=[r for r in rows if str(r.get('supervisor') or 'Por asignar')==name]
+        rs.sort(key=lambda r:str(r.get('advisor_name') or r.get('advisor_code') or ''))
+        group=groups_by_name.get(name,{})
+        title=name+' · '+str(len(rs))+' asesores'
+        story.append(p(title,'N55H1'))
+        if group.get('coverage_label'):story.append(p(group['coverage_label'],'N55Small'))
+        advisor_data=[['Asesor','Activados / cartera\nAvance','Nuevos / meta\nAvance','Volumen / cuota\nAvance','Líneas / meta\nAvance','Fecha de corte']]
+        for r in rs:
+            identity=escape(str(r.get('advisor_name') or 'Nombre pendiente'))+'<br/><font size="7.3" color="#637E8A">Código '+escape(nx55_compact_display_code(r))+'</font>'
+            advisor_data.append([p(identity,'N55Cell',True),metric(r,'activated','portfolio','activation_pct'),metric(r,'new_actual','new_goal','new_pct'),
+                volume_metric(r),metric(r,'line_actual','line_goal','line_pct'),r.get('source_cutoff') or 'No informado'])
+        story.append(table(advisor_data,[U*.22,U*.14,U*.13,U*.225,U*.14,U*.145]))
+        sources=list(dict.fromkeys(str(r.get('source_label') or 'Fuente no informada') for r in rs))
+        story.append(p('Fuentes: '+' | '.join(sources),'N55Small'))
+        team_notes=[]
+        for r in rs:
+            team_notes.extend(str(r.get('advisor_name') or r.get('advisor_code') or 'Asesor')+': '+v for v in nx55_compact_observations(r.get('observations')))
+        if level=='mediano':
+            large=len(rs)>10
+            if large:
+                volume=nx55_compact_volume(group)
+                chart=nx55_pdf_compact_chart([graph_value(group,'volume_pct',True)],'Avance conocido · '+volume['unit'],U*.48,48,True,1.)
+            else:
+                ranked=sorted([r for r in rs if nx55_compact_number(r.get('sales_actual')) is not None],key=lambda r:float(r['sales_actual']),reverse=True)[:5]
+                chart=nx55_pdf_compact_chart([(r.get('advisor_name') or r.get('advisor_code'),r.get('sales_actual')) for r in ranked],'Venta informada · Top 5 del equipo',U*.48,96)
+            limit=1 if large else 4
+            summary='Observaciones: '+' | '.join(team_notes[:limit]) if team_notes else 'Sin observaciones adicionales en las fuentes disponibles.'
+            if len(team_notes)>limit:summary+=' | '+str(len(team_notes)-limit)+' observaciones adicionales disponibles en el informe completo.'
+            cells=Table([[chart,p(summary,'N55Small')]],colWidths=[U*.50,U*.50],hAlign='LEFT');cells.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),8)]));story.append(cells)
+        elif team_notes:
+            summary='Observaciones: '+' | '.join(team_notes[:2])
+            if len(team_notes)>2:summary+=' | Detalle adicional en el informe completo.'
+            story.append(p(summary,'N55Small'))
+        story.append(Spacer(1,6))
+    doc.build(story,onFirstPage=header,onLaterPages=header)
+    return output.getvalue()
+
+
+def nx55_export_compact_excel(context,level='resumido'):
+    """Resumen y asesores; unidades de volumen visibles, porcentajes editables."""
+    import io,xlsxwriter
+    from xlsxwriter.utility import xl_rowcol_to_cell
+    if level not in {'resumido','mediano'}:raise ValueError('Elige resumido o mediano.')
+    rows,groups=nx55_compact_data(context);output=io.BytesIO()
+    book=xlsxwriter.Workbook(output,{'in_memory':True,'strings_to_formulas':False,'strings_to_urls':False})
+    navy='#15384D';teal='#00858A';gray='#667E8B'
+    title=book.add_format({'bold':True,'font_size':20,'font_color':navy})
+    subtitle=book.add_format({'font_size':10,'font_color':gray,'text_wrap':True,'valign':'top'})
+    header=book.add_format({'bold':True,'bg_color':navy,'font_color':'white','text_wrap':True,'valign':'vcenter'})
+    text=book.add_format({'font_size':10,'valign':'top','text_wrap':True})
+    count=book.add_format({'font_size':10,'valign':'top','num_format':'#,##0.##;[Red]-#,##0.##'})
+    money=book.add_format({'font_size':10,'valign':'top','num_format':'$#,##0.00;[Red]-$#,##0.00'})
+    partial_count=book.add_format({'font_size':10,'valign':'top','font_color':gray,'num_format':'#,##0.##"*";[Red]-#,##0.##"*"'})
+    partial_money=book.add_format({'font_size':10,'valign':'top','font_color':gray,'num_format':'$#,##0.00"*";[Red]-$#,##0.00"*"'})
+    pct=book.add_format({'font_size':10,'valign':'top','num_format':'0.0%;[Red]-0.0%'})
+    missing=book.add_format({'font_size':10,'font_color':gray,'valign':'top'})
+    green=book.add_format({'bg_color':'#E0F3EB','font_color':'#12664F'})
+    amber=book.add_format({'bg_color':'#FFF0DA','font_color':'#885F22'})
+    def write(ws,r,c,value,kind='text'):
+        fm={'text':text,'count':count,'money':money,'pct':pct}[kind]
+        n=nx55_compact_number(value)
+        if value is None or (kind!='text' and n is None):ws.write_string(r,c,'N/D',missing)
+        elif kind=='text':ws.write_string(r,c,str(value),fm)
+        else:ws.write_number(r,c,n,fm)
+    def ratio(ws,r,c,ac,gc,value):
+        cached=nx55_compact_number(value)
+        if cached is None:ws.write_string(r,c,'N/D',missing);return
+        a=xl_rowcol_to_cell(r,ac);g=xl_rowcol_to_cell(r,gc)
+        ws.write_formula(r,c,f'=IF(AND(ISNUMBER({a}),ISNUMBER({g}),{g}>0),{a}/{g},"N/D")',pct,cached)
+    period=str(context.get('period') or '')
+    reporting=context.get('reporting') or {}
+    delivery_label=str(reporting.get('label') or '')
+    cutoff=str(reporting.get('cutoff') or '')
+    delivery_note=str(reporting.get('note') or '')
+    delivery_text=' · '.join(v for v in [delivery_label,('Corte '+cutoff) if cutoff else '',delivery_note] if v)
+    book.set_properties({'title':delivery_label or 'Resultados del equipo comercial','subject':delivery_text,'author':'Makropetrol','keywords':str(reporting.get('kind') or '')})
+    rules='Activación de cartera ≥ 70 %; líneas asignadas = 100 %. * Suma parcial: faltan datos, sin evaluación definitiva. N/D = dato no disponible/comparable. USD y litros se conservan por separado.'
+    def sheet(name,heading):
+        ws=book.add_worksheet(name);ws.hide_gridlines(2);ws.freeze_panes(6,2);ws.set_landscape();ws.fit_to_pages(1,0);ws.set_paper(9)
+        ws.set_margins(.25,.25,.35,.35);ws.set_header('&LNEXUS COMERCIAL&R'+period);ws.set_footer('&L'+(delivery_label or heading)+(' · corte '+cutoff if cutoff else '')+'&R&P / &N')
+        ws.merge_range('A1:R2',((delivery_label+' · ') if delivery_label else '')+heading,title);ws.merge_range('A3:R4',delivery_text+'\n'+rules if delivery_text else rules,subtitle);ws.set_row(2,25 if delivery_text else 15);ws.set_row(3,25 if delivery_text else 15);ws.set_row(5,44);return ws
+    summary=sheet('Resumen','Resultados por supervisor · '+period)
+    heads=['Supervisor','Asesores','Cartera','Activados','Activación %','Meta nuevos','Nuevos','Nuevos %','Unidad volumen','Cuota volumen','Logro volumen','Volumen %','Meta líneas','Líneas activadas','Líneas %','Cobertura','Corte de fuente','Observaciones']
+    for c,label in enumerate(heads):summary.write(5,c,label,header)
+    for ri,g in enumerate(groups,6):
+        v=nx55_compact_volume(g)
+        values=[g.get('supervisor'),g.get('advisors'),g.get('portfolio'),g.get('activated'),None,g.get('new_goal'),g.get('new_actual'),None,v['unit'],v['goal'],v['actual'],None,g.get('line_goal'),g.get('line_actual'),None,g.get('coverage_label'),g.get('source_cutoff') or 'No informado',' | '.join(nx55_compact_observations(g.get('observations')))]
+        for ci,value in enumerate(values):
+            if ci in {4,7,11,14}:continue
+            kind=('money' if v['unit']=='USD' else 'count') if ci in {9,10} else 'count' if ci in {1,2,3,5,6,12,13} else 'text'
+            known_key={2:'portfolio_known',3:'activated_known',5:'new_goal_known',6:'new_actual_known',12:'line_goal_known',13:'line_actual_known'}.get(ci)
+            known=v.get('goal_known') if ci==9 else v.get('actual_known') if ci==10 else g.get(known_key) if known_key else None
+            if value is None and kind in {'count','money'} and nx55_compact_number(known) is not None:
+                summary.write_number(ri,ci,float(known),partial_money if kind=='money' else partial_count)
+            else:write(summary,ri,ci,value,kind)
+        for c,a,t,k in [(4,3,2,'activation_pct'),(7,6,5,'new_pct'),(14,13,12,'line_pct')]:ratio(summary,ri,c,a,t,g.get(k))
+        ratio(summary,ri,11,10,9,v['pct']);summary.set_row(ri,34)
+    summary.set_column('A:A',24);summary.set_column('B:O',13);summary.set_column('P:P',28);summary.set_column('Q:Q',19);summary.set_column('R:R',54)
+    if groups:
+        last=5+len(groups);summary.autofilter(5,0,last,len(heads)-1)
+        for c,threshold in [(4,.7),(14,1.)]:
+            summary.conditional_format(6,c,last,c,{'type':'cell','criteria':'>=','value':threshold,'format':green})
+            summary.conditional_format(6,c,last,c,{'type':'cell','criteria':'<','value':threshold,'format':amber})
+        # Datos de gráficas: los porcentajes ausentes no se sustituyen por cero.
+        chart_data=summary;chart_base=19;summary.set_column(chart_base,chart_base+3,14,None,{'hidden':True})
+        for ci,label in enumerate(['Supervisor','Activación %','Supervisor USD','Avance USD']):chart_data.write(0,chart_base+ci,label)
+        def chart_record(group,volume=False):
+            v=nx55_compact_volume(group)
+            full=v['pct'] if volume else group.get('activation_pct')
+            known=v['pct_known'] if volume else group.get('activation_pct_known')
+            partial=nx55_compact_number(full) is None
+            value=nx55_compact_number(known if partial else full)
+            return (str(group.get('supervisor'))+(' (parcial)' if partial else ''),value) if value is not None else None
+        active=[row for g in groups if (row:=chart_record(g)) is not None]
+        usd=[row for g in groups if nx55_compact_volume(g)['unit']=='USD' and (row:=chart_record(g,True)) is not None]
+        for ri,(label,value) in enumerate(active,1):chart_data.write_string(ri,chart_base,label);chart_data.write_number(ri,chart_base+1,value)
+        for ri,(label,value) in enumerate(usd,1):chart_data.write_string(ri,chart_base+2,label);chart_data.write_number(ri,chart_base+3,value)
+        for title_text,col,data,anchor in [('Activación conocida · parcial si se indica',0,active,'A'+str(last+5)),('Avance USD conocido · parcial si se indica',2,usd,'J'+str(last+5))]:
+            col+=chart_base
+            chart=book.add_chart({'type':'column'})
+            if data:chart.add_series({'name':title_text,'categories':['Resumen',1,col,len(data),col],'values':['Resumen',1,col+1,len(data),col+1],
+                'fill':{'color':teal},'border':{'none':True},'data_labels':{'value':True,'num_format':'0%'}})
+            else:
+                # Una gráfica sin serie no es exportable; una serie vacía visible
+                # no representa un logro cero y queda explicada en el título.
+                chart_data.write_string(1,col,'N/D');chart_data.write_blank(1,col+1,None)
+                chart.add_series({'name':'Sin resultados comparables','categories':['Resumen',1,col,1,col],'values':['Resumen',1,col+1,1,col+1]})
+                title_text+=' · N/D'
+            chart.show_hidden_data();chart.set_title({'name':title_text});chart.set_legend({'none':True});chart.set_y_axis({'num_format':'0%','min':0});chart.set_size({'width':560,'height':270});chart.show_blanks_as('gap')
+            summary.insert_chart(anchor,chart)
+    advisors=sheet('Asesores','Resultados de asesores activos · '+period)
+    headings=['Supervisor','Código','Asesor','Cartera','Activados','Activación %','Meta nuevos','Nuevos','Nuevos %','Unidad volumen','Cuota volumen','Logro volumen','Volumen %','Meta líneas','Líneas activadas','Líneas %','Corte de fuente','Fuente','Observaciones']
+    for c,label in enumerate(headings):advisors.write(5,c,label,header)
+    ordered=sorted(rows,key=lambda r:(str(r.get('supervisor') or ''),str(r.get('advisor_name') or '')))
+    for ri,r in enumerate(ordered,6):
+        v=nx55_compact_volume(r)
+        values=[r.get('supervisor'),nx55_compact_display_code(r),r.get('advisor_name'),r.get('portfolio'),r.get('activated'),None,r.get('new_goal'),r.get('new_actual'),None,v['unit'],v['goal'],v['actual'],None,r.get('line_goal'),r.get('line_actual'),None,r.get('source_cutoff') or 'No informado',r.get('source_label') or 'Fuente no informada',' | '.join(nx55_compact_observations(r.get('observations')))]
+        for ci,value in enumerate(values):
+            if ci in {5,8,12,15}:continue
+            kind=('money' if v['unit']=='USD' else 'count') if ci in {10,11} else 'count' if ci in {3,4,6,7,13,14} else 'text'
+            write(advisors,ri,ci,value,kind)
+        for c,a,t,k in [(5,4,3,'activation_pct'),(8,7,6,'new_pct'),(15,14,13,'line_pct')]:ratio(advisors,ri,c,a,t,r.get(k))
+        ratio(advisors,ri,12,11,10,v['pct']);advisors.set_row(ri,31)
+    advisors.set_column('A:A',24);advisors.set_column('B:B',15);advisors.set_column('C:C',30);advisors.set_column('D:P',13);advisors.set_column('Q:Q',19);advisors.set_column('R:R',44);advisors.set_column('S:S',58)
+    if ordered:
+        advisors.autofilter(5,0,5+len(ordered),len(headings)-1)
+        for c,threshold in [(5,.7),(15,1.)]:
+            advisors.conditional_format(6,c,5+len(ordered),c,{'type':'cell','criteria':'>=','value':threshold,'format':green})
+            advisors.conditional_format(6,c,5+len(ordered),c,{'type':'cell','criteria':'<','value':threshold,'format':amber})
+    if level=='mediano':
+        notes=[]
+        for r in ordered:
+            for note in nx55_compact_observations(r.get('observations')):notes.append((r.get('supervisor'),r.get('advisor_name'),note,r.get('source_label'),r.get('source_cutoff') or 'No informado'))
+        if notes:
+            ws=book.add_worksheet('Observaciones');ws.hide_gridlines(2);ws.freeze_panes(1,2)
+            for ci,label in enumerate(['Supervisor','Asesor','Observación','Fuente','Corte']):ws.write(0,ci,label,header)
+            for ri,values in enumerate(notes,1):
+                for ci,value in enumerate(values):write(ws,ri,ci,value)
+                ws.set_row(ri,31)
+            ws.set_column('A:B',26);ws.set_column('C:C',85);ws.set_column('D:D',48);ws.set_column('E:E',20);ws.autofilter(0,0,len(notes),4)
+    book.close();return output.getvalue()
+
+
+
+
+# Los niveles cortos se descargan aparte; el completo conserva su respaldo.
+_NX55_COMPLETE_EXPORT_PDF = nx5_export_pdf
+_NX55_COMPLETE_EXPORT_EXCEL = nx5_export_excel
+_NX55_IMPORTED_METRIC_ROWS = nx54_metric_rows
+
+
+def nx54_metric_rows(context,advisor_code=None):
+    rows=_NX55_IMPORTED_METRIC_ROWS(context,advisor_code)
+    if context.get('result_mode')=='planillas':
+        rows=[r for r in rows if not r['metric_label'].startswith(('Clientes activos / cartera','Líneas por activar'))]
+    for a in context.get('advisors',[]):
+        if advisor_code is not None and str(a['advisor_code'])!=str(advisor_code):continue
+        actual=nx55_ratio(nx5_number(a.get('activated_reported')),nx5_number(a.get('portfolio')))
+        base={'advisor_code':a['advisor_code'],'advisor_name':a['name'],'source_file':a.get('source_filename'),
+            'source_sheet':(a.get('management_record') or {}).get('source_sheet') or 'Fuente de resultados','source_cell':'Regla de gestión: 70 %'}
+        rows.append(dict(base,metric_label='Activación de cartera · mínimo 70 %',unit='proporcion',target=.7,actual=actual,
+            attainment=None if actual is None else actual/.7,note='Resultado = activados / cartera. El avance compara ese porcentaje con el mínimo de 70 %.'))
+        if context.get('result_mode')=='planillas':
+            target=nx5_number(a.get('line_goal'));achieved=nx5_number(a.get('line_actual'))
+            if target is not None or achieved is not None:
+                rows.append(dict(base,metric_label='Líneas asignadas · activar todas',unit='lineas',target=target,actual=achieved,
+                    attainment=nx55_ratio(achieved,target),note='Logro declarado del resumen; activar una línea no equivale a alcanzar su cuota USD.'))
+    return rows
+
+
+def nx5_export_pdf(context,options=None):
+    level=(options or {}).get('detail') or context.get('report_level') or 'resumido'
+    if level in {'resumido','mediano'}:return nx55_export_compact_pdf(context,level)
+    return _NX55_COMPLETE_EXPORT_PDF(context,options)
+
+
+def nx5_export_excel(context):
+    level=context.get('report_level') or 'complete'
+    if level in {'resumido','mediano'}:return nx55_export_compact_excel(context,level)
+    return _NX55_COMPLETE_EXPORT_EXCEL(context)
+
+
+def nx55_result_selector(context):
+    with st.sidebar:
+        mode=st.selectbox('Fuente de resultados',['Planillas de supervisores','Seguimiento PDF'],key='nx55_result_source',
+            help='Cada vista usa una fuente: no completa los huecos del cierre con cifras de otro corte.')
+    return nx55_overlay_results(context,'planillas' if mode=='Planillas de supervisores' else 'pdf')
+
+
+def nx55_live_results(context):
+    rows=nx55_report_rows(context)
+    st.markdown('#### Resultados por supervisor')
+    teams=nx55_supervisor_rows(context)
+    nx5_frame([{'Supervisor':r['supervisor'],'Asesores':r['advisors'],'Cartera conocida':r.get('portfolio_known'),
+        'Activados conocidos':r.get('activated_known'),'Activación total %':None if r['activation_pct'] is None else r['activation_pct']*100,
+        'Clientes nuevos conocidos':r.get('new_actual_known'),'Meta de volumen conocida':r.get('volume_goal_known'),'Unidad':r['volume_unit'],
+        'Volumen conocido':r.get('volume_actual_known'),'Líneas activadas conocidas':r.get('line_actual_known'),'Cobertura de datos':r['coverage_label']} for r in teams])
+    st.caption('Las columnas «conocido» son sumas parciales cuando faltan datos. El porcentaje del supervisor solo se presenta como total cuando todos sus asesores tienen datos comparables; no se promedian porcentajes individuales.')
+
+
 # Interfaz unificada sobre la aplicación comercial original.
 _NX5_SECTIONS=['Inicio','Cargar información','Equipo comercial','Informes']
 _NX5_TOUR=[
@@ -11118,7 +13339,7 @@ _NX5_TOUR=[
     ('Cargar información','1. Carga el seguimiento','Sube el PDF completo del programa. NEXUS lee los vendedores y sus páginas de continuación. Revisa el período y guarda el corte.'),
     ('Cargar información','2. Registra las metas','Abre Metas y cuotas. Puedes editar la tabla, importar Excel, asignar una meta a varios o repartir un total con porcentajes.'),
     ('Equipo comercial','3. Examina el equipo','Selecciona un asesor para ver sus cifras, clientes, líneas y compromisos. Los supervisores se asignan en Configuración → Equipo.'),
-    ('Informes','4. Prepara la entrega','Elige informe del equipo, un asesor o archivos separados. Deja «Completo» para incluir clientes y líneas dentro del PDF, además de gráficas y controles. El índice permite ir a cada asesor. Un corte parcial se presenta como avance.')]
+    ('Informes','4. Prepara la entrega','Elige semanal o mensual y la fecha real de corte. Prepara el informe del equipo, un asesor o archivos separados en PDF y Excel. Resumido muestra resultados; Completo añade el respaldo disponible. Los cortes quedan guardados y los clientes nominales requieren su fuente detallada.')]
 
 
 def nx5_go(section):
@@ -11213,7 +13434,7 @@ def nx5_controls(context,expanded=False):
 
 def nx5_sidebar(context,periods):
     with st.sidebar:
-        st.markdown('<div class="nx5-brand"><div class="nx5-brand-icon">N</div><div><div class="nx5-brand-title">nexus.</div><div class="nx5-brand-sub">EQUIPO COMERCIAL · 5.3</div></div></div>',unsafe_allow_html=True)
+        st.markdown('<div class="nx5-brand"><div class="nx5-brand-icon">N</div><div><div class="nx5-brand-title">nexus.</div><div class="nx5-brand-sub">EQUIPO COMERCIAL · 5.5</div></div></div>',unsafe_allow_html=True)
         if st.session_state.get('nx5_period') not in periods:st.session_state['nx5_period']=periods[0]
         period=st.selectbox('Mes de trabajo',periods,key='nx5_period',format_func=period_label)
         if period!=context['period']:context=nx5_context(period)
@@ -11234,6 +13455,7 @@ def nx5_sidebar(context,periods):
 
 
 def nx5_home(context):
+    nx55_scope_notice(context)
     nx5_hero('Todo tu equipo. Una vista clara.','Ventas, metas y clientes con sus fechas y controles de origen.','SEGUIMIENTO COMERCIAL')
     rows=context['advisors']
     if not rows:
@@ -11244,9 +13466,9 @@ def nx5_home(context):
     covered=[r for r in rows if r.get('sales_goal') and r.get('sales_reported') is not None]
     with st.container(key='nx5_kpi_target'):
         a,b,c,d=st.columns(4)
-        a.metric('Ventas informadas · USD',nx5_usd(sum(r.get('sales_reported') or 0 for r in rows)))
-        b.metric('Cobros informados · USD',nx5_usd(sum(r.get('collections') or 0 for r in rows)))
-        c.metric('Metas cargadas',f'{len(covered)} / {len(rows)}')
+        a.metric('Ventas USD conocidas',nx5_usd(sum(r['sales_reported'] for r in rows if r.get('sales_reported') is not None) if any(r.get('sales_reported') is not None for r in rows) else None))
+        b.metric('Con venta USD informada',str(sum(r.get('sales_reported') is not None for r in rows))+' / '+str(len(rows)))
+        c.metric('Cuotas de venta USD',str(sum(r.get('sales_goal') is not None for r in rows))+' / '+str(len(rows)))
         quota=sum(r['sales_goal'] for r in covered)
         d.metric('Cumplimiento con meta','—' if not quota else f'{100*sum(r["sales_reported"] for r in covered)/quota:.1f}%')
     st.caption('El cumplimiento considera solo a los asesores con meta y venta disponibles. Los cobros pueden corresponder a facturas de meses anteriores.')
@@ -11266,9 +13488,13 @@ def nx5_home(context):
         grouped={}
         for r in rows:
             sup=r.get('supervisor','Por asignar');g=grouped.setdefault(sup,{'Supervisor':sup,'Ventas USD':0,'Asesores':0})
-            g['Ventas USD']+=r.get('sales_reported') or 0;g['Asesores']+=1
+            if r.get('sales_reported') is not None:g['Ventas USD']+=r['sales_reported'];g['known']=g.get('known',0)+1
+            g['Asesores']+=1
+        for g in grouped.values():
+            if not g.get('known'):g['Ventas USD']=None
         nx5_plot(px.bar(pd.DataFrame(grouped.values()),x='Supervisor',y='Ventas USD',color='Supervisor',color_discrete_sequence=['#6aaeff','#41dcc7','#a49eff','#89c7e8','#c8a6ff']).update_layout(height=370,title='Resultados por supervisor'),'nx5_home_supervisors')
         st.caption('Asigna los nombres y supervisores del período en Configuración → Equipo. Un alias no prueba la identidad del asesor.')
+    nx55_live_results(context)
     nx5_table(context)
     nx5_controls(context)
 
@@ -11327,9 +13553,10 @@ def nx5_goal_ui(context):
     with st.container(key='nx5_goal_target'):
         st.write('Las metas se guardan por asesor y mes. El % VENTAS del reporte permanece como participación y nunca se utiliza como cuota.')
         if not rows:st.info('Primero carga un seguimiento para identificar los códigos de los asesores.');return
-        modes=['Tabla por asesor','Misma meta para varios','Repartir total por porcentajes','Importar Excel de cuotas','Metas por línea']
+        modes=['Archivos de supervisores','Tabla por asesor','Misma meta para varios','Repartir total por porcentajes','Importar Excel de cuotas','Metas por línea']
         mode=st.selectbox('Cómo quieres cargar las metas',modes,key='nx5_goal_mode')
-        if mode=='Tabla por asesor':
+        if mode=='Archivos de supervisores':nx54_goal_batch_ui(context)
+        elif mode=='Tabla por asesor':
             with st.form('nx5_goal_grid_form_'+period):
                 edited=st.data_editor(pd.DataFrame(nx5_goal_rows(context)),hide_index=True,width='stretch',disabled=['advisor_code','name','supervisor'],
                     column_config={'advisor_code':'Código','name':'Nombre','supervisor':'Supervisor','sales_goal':st.column_config.NumberColumn('Meta venta USD',min_value=0.,format='%.2f'),
@@ -11411,33 +13638,17 @@ def nx5_line_goal_ui(context):
 
 
 def nx5_upload(context):
-    nx5_hero('Carga una vez. Trabaja con claridad.','Seguimientos, metas y fuentes con sus períodos separados.','TU INFORMACIÓN')
-    if st.session_state.get('nx5_upload_tab') not in ['Seguimiento PDF','Metas y cuotas','Histórico conservado']:st.session_state['nx5_upload_tab']='Seguimiento PDF'
-    choice=st.segmented_control('Qué quieres cargar',['Seguimiento PDF','Metas y cuotas','Histórico conservado'],key='nx5_upload_tab') or 'Seguimiento PDF'
-    if choice=='Seguimiento PDF':nx5_report_upload(context)
+    nx5_hero('Los archivos del mes, en un solo lugar.','Actualiza cierres, cuotas o el seguimiento del programa.','CARGAR INFORMACIÓN')
+    options=['Cierres y avances','Seguimiento PDF','Metas y cuotas','Histórico conservado']
+    if st.session_state.get('nx5_upload_tab') not in options:st.session_state['nx5_upload_tab']='Cierres y avances'
+    choice=st.segmented_control('Qué quieres cargar',options,key='nx5_upload_tab') or options[0]
+    if choice=='Cierres y avances':nx55_management_ui(context)
+    elif choice=='Seguimiento PDF':nx5_report_upload(context)
     elif choice=='Metas y cuotas':nx5_goal_ui(context)
     else:
-        st.write('Las bases anteriores se conservan en la misma ubicación. Los nuevos PDF no se suman a aquellos cierres.')
+        st.caption('Los registros de versiones anteriores se conservan por período. Las fuentes de resultados vigentes se eligen en Cierres y avances.')
         old_sources=commercial_sources_v4(DB_PATH,False)
         nx5_frame([{'Archivo':x.get('metadata',{}).get('filename'),'Referencia':x.get('_reference'),'Habilitado':x.get('_enabled')} for x in old_sources])
-        with st.expander('Importar una matriz de cuotas/cierre del formato anterior'):
-            file=st.file_uploader('Excel original del formato anterior',type=['xlsx','xlsm'],key='nx5_legacy_excel')
-            kind=st.selectbox('Contenido del archivo',['metas','cierre'],format_func=lambda x:'Metas / cuotas' if x=='metas' else 'Resultados / cierre',key='nx5_legacy_kind')
-            if st.button('Leer matriz histórica'):
-                if not file:st.warning('Selecciona el Excel.')
-                else:
-                    try:
-                        item=parse_commercial_workbook_v4(file.getvalue(),file.name,kind=kind,period_override=context['period'])
-                        st.session_state['nx5_legacy_pending']=item
-                    except Exception as exc:st.error(str(exc))
-            item=st.session_state.get('nx5_legacy_pending')
-            if item:
-                nx5_frame(item.get('advisor_rows',[]))
-                st.caption('Las hojas conservan sus fechas y asignaciones originales. Las metas nuevas se gestionan en Metas y cuotas.')
-                if st.button('Conservar matriz revisada'):
-                    try:
-                        save_commercial_sources_v4([item],DB_PATH);st.session_state.pop('nx5_legacy_pending',None);st.session_state['nx5_flash']='Matriz histórica conservada.';st.rerun()
-                    except ValueError as exc:st.error(str(exc))
 
 
 def nx5_team(context):
@@ -11445,6 +13656,7 @@ def nx5_team(context):
     rows=context['advisors']
     if not rows:st.info('Carga un seguimiento para abrir el equipo.');return
     nx5_status(context)
+    nx55_scope_notice(context)
     with st.container(key='nx5_team_target'):
         scope=st.radio('Vista',['Equipo completo','Un asesor'],horizontal=True,key='nx5_team_scope')
         if scope=='Equipo completo':
@@ -11466,6 +13678,10 @@ def nx5_team(context):
                 fig=go.Figure([go.Bar(name='Venta informada',x=[row.get('name')],y=[row.get('sales_reported')],marker_color='#6aaeff'),go.Bar(name='Meta mensual',x=[row.get('name')],y=[row['sales_goal']],marker_color='#41dcc7')]);fig.update_layout(height=300,barmode='group',yaxis_title='USD')
                 nx5_plot(fig,'nx5_advisor_goal_chart')
             nx5_controls(single)
+            imported=nx54_metric_rows(single,code)
+            if imported:
+                st.markdown('#### Metas de las planillas del supervisor')
+                nx5_frame([{'Indicador':r['metric_label'],'Unidad':r['unit'],'Meta':r['target'],'Resultado comparable':r['actual'],'Avance':r['attainment'],'Observación':r['note']} for r in imported])
         with tabs[1]:
             st.info('Se muestran las clasificaciones del programa. Un cliente nuevo puede tener código antiguo o no haber comprado. Nuevos y activados no se suman.')
             kind=st.selectbox('Listado',['clients_activated','clients_inactive','clients_new'],format_func=lambda x:{'clients_activated':'Activados según programa','clients_inactive':'No activados según programa','clients_new':'Nuevos según programa'}[x])
@@ -11503,23 +13719,9 @@ def nx5_settings(context):
     st.button('Volver al tablero',on_click=nx5_go,args=('Inicio',))
     tabs=st.tabs(['Equipo','Criterios de clientes','Respaldo'])
     with tabs[0]:
-        rows=context['advisors']
-        nx52_roster_photo_ui(context)
-        if not rows:st.info('Carga el seguimiento para completar sus nombres y supervisores.')
-        else:
-            st.write('Completa o pega nombres y supervisores. La asignación se guarda únicamente para '+context['period']+'. Marcar inactivo conserva el historial.')
-            roster=[]
-            with nx5_connection(str(DB_PATH)) as con:stored={c:json.loads(p) for c,p in con.execute('SELECT advisor_code,payload FROM nx5_roster WHERE period=?',(context['period'],))}
-            for r in rows:
-                saved=stored.get(r['advisor_code'],{})
-                roster.append(dict(advisor_code=r['advisor_code'],advisor_alias=r.get('advisor_alias',''),name=saved.get('name') or (r.get('name') if r.get('legacy') or r.get('photo_roster') else ''),supervisor=saved.get('supervisor') or (r.get('supervisor') if r.get('supervisor')!='Por asignar' else ''),active=r.get('active',True)))
-            with st.form('nx5_roster_form_'+context['period']):
-                edits=st.data_editor(pd.DataFrame(roster),hide_index=True,width='stretch',disabled=['advisor_code','advisor_alias'],column_config={'advisor_code':'Código del reporte','advisor_alias':'Alias del reporte','name':'Nombre completo','supervisor':'Supervisor del mes','active':'En la empresa'})
-                if st.form_submit_button('Guardar equipo del mes',type='primary'):
-                    try:nx5_save_roster(context['period'],edits.to_dict('records'));st.session_state['nx5_flash']='Equipo actualizado para el período seleccionado.';st.rerun()
-                    except ValueError as exc:st.error(str(exc))
-            if context['brand_goals']:st.caption('Las metas de línea se gestionan en Cargar información → Metas y cuotas.')
+        nx55_roster_upload_ui(context)
     with tabs[1]:
+        st.info('Criterios vigentes: activación de cartera de 70 % o más; activar el 100 % de las líneas asignadas. Los porcentajes del supervisor usan sumas comparables, no un promedio de porcentajes.')
         st.info('Por ahora, los informes muestran «Activados según programa» y «Nuevos según programa». No se atribuye recuperación ni primera compra sin evidencia del historial.')
         st.write('Un código de cliente puede llevar tiempo abierto sin compras. Para distinguir registro, primera compra y recuperación necesitamos el identificador estable del cliente y sus fechas de compra; un listado de nombres no basta.')
         with st.form('nx5_client_rules_form'):
@@ -11544,6 +13746,224 @@ def nx5_settings(context):
         nx53_portable_ui()
 
 
+# NEXUS 5.6 · Entregas semanales acumuladas y cierres mensuales conservados.
+def nx56_init(db_path=None):
+    with nx5_connection(db_path) as con:
+        con.execute('''CREATE TABLE IF NOT EXISTS nx56_report_snapshots(
+            snapshot_id TEXT PRIMARY KEY,period TEXT NOT NULL,cutoff TEXT NOT NULL,
+            kind TEXT NOT NULL,is_final INTEGER NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL)''')
+        con.execute('CREATE INDEX IF NOT EXISTS nx56_report_snapshot_period ON nx56_report_snapshots(period,cutoff)')
+
+
+def nx56_date(value):
+    from datetime import date, datetime
+    if isinstance(value,datetime):return value.date()
+    if isinstance(value,date):return value
+    try:return date.fromisoformat(str(value)[:10])
+    except (ValueError,TypeError):return None
+
+
+def nx56_source_cutoffs(context):
+    """Solo cortes de datos; una fecha de emisión no acredita el fin del período."""
+    dates=[];undated=[]
+    for advisor in context.get('advisors',[]):
+        name=advisor.get('name') or advisor.get('advisor_code') or 'Asesor'
+        raw=advisor.get('source_cutoff') or advisor.get('end_date') or (advisor.get('management_record') or {}).get('end_date')
+        parsed=nx56_date(raw)
+        if parsed:dates.append({'label':str(name),'date':parsed.isoformat()})
+        else:undated.append(str(name))
+    # Incluye cortes de la fuente activa aun cuando alguna fila carezca de fecha.
+    selected_files={a.get('source_filename') for a in context.get('advisors',[])}
+    for source in context.get('sources',[]):
+        meta=source.get('metadata',source)
+        if not isinstance(meta,dict):continue
+        filename=meta.get('filename')
+        if filename and selected_files and filename not in selected_files:continue
+        parsed=nx56_date(meta.get('end_date'))
+        if parsed:dates.append({'label':str(filename or 'Fuente activa'),'date':parsed.isoformat()})
+    return {'dated':dates,'undated_advisors':undated}
+
+
+def nx56_apply_report_context(context,kind,cutoff,final_confirmed=False,undated_confirmed=False):
+    """Fecha declarada aparte de las fechas originales. Nunca calcula semanas por resta."""
+    import copy,calendar
+    from datetime import date
+    if kind not in {'semanal','mensual'}:raise ValueError('Elige seguimiento semanal o cierre mensual.')
+    period=str(context.get('period') or '')
+    try:
+        year,month=map(int,period.split('-'));last=date(year,month,calendar.monthrange(year,month)[1])
+    except (ValueError,TypeError):raise ValueError('El mes del informe no es válido.')
+    cut=nx56_date(cutoff)
+    if cut is None or cut.strftime('%Y-%m')!=period:raise ValueError('La fecha de corte debe estar dentro del mes seleccionado.')
+    if cut>nx56_date(nx5_now()):raise ValueError('La fecha de corte no puede estar en el futuro.')
+    if not context.get('advisors'):raise ValueError('No hay asesores seleccionados para esta entrega.')
+    evidence=nx56_source_cutoffs(context)
+    future=[r for r in evidence['dated'] if r['date']>cut.isoformat()]
+    if future:raise ValueError('El corte elegido es anterior a los datos de '+future[0]['label']+' ('+future[0]['date']+'). Carga el avance correspondiente a esa semana.')
+    outside=[r for r in evidence['dated'] if r['date'][:7]!=period]
+    if outside:raise ValueError('Hay una fuente de otro mes: '+outside[0]['label']+'. Revisa la selección.')
+    older=[r for r in evidence['dated'] if r['date']<cut.isoformat()]
+    missing=[]
+    for row in nx55_report_rows(context):
+        fields=['portfolio','activated','new_goal','new_actual','volume_goal','volume_actual','line_goal','line_actual']
+        if any(row.get(field) is None for field in fields):missing.append(str(row['advisor_name']))
+    undated=evidence['undated_advisors']
+    dates_confirmed=not older and (not undated or bool(undated_confirmed))
+    final=bool(kind=='mensual' and final_confirmed and cut==last and dates_confirmed and not missing)
+    if final_confirmed and kind=='mensual' and cut!=last:raise ValueError('Un cierre mensual final debe tener corte al último día del mes.')
+    out=copy.deepcopy(context)
+    title='Seguimiento semanal acumulado del mes' if kind=='semanal' else 'Cierre mensual'
+    state=('CIERRE MENSUAL FINAL' if final else 'SEGUIMIENTO SEMANAL' if kind=='semanal' else 'CIERRE MENSUAL INCOMPLETO')
+    notes=['Resultados acumulados desde el inicio del mes hasta el corte disponible. Las metas corresponden al mes completo.']
+    if kind=='semanal':notes.append('Este informe no representa solo las ventas de siete días. No se restan contadores acumulados de clientes entre cortes.')
+    if older:notes.append(str(len({r['label'] for r in older}))+' registros o fuentes tienen un corte anterior al elegido; se conserva su fecha original.')
+    if undated:
+        notes.append(('Corte de las fuentes sin fecha confirmado por el usuario para esta entrega; no está impreso en la fuente.' if undated_confirmed else 'Hay fuentes sin corte impreso ni confirmación del usuario. La fecha elegida identifica la entrega, no acredita la fecha de los datos.'))
+    if missing:notes.append(('1 asesor tiene' if len(missing)==1 else str(len(missing))+' asesores tienen')+' indicadores o metas sin informar; se conservan como N/D.')
+    if kind=='mensual' and final_confirmed and not final:notes.append('No se etiqueta como final porque quedan datos faltantes o cortes anteriores/sin confirmar.')
+    out['report_cadence']=kind;out['report_cutoff']=cut.isoformat();out['report_title']=title
+    out['report_state']=state+' · corte de entrega '+cut.strftime('%d/%m/%Y')
+    out['report_is_final']=final;out['report_notes']=notes
+    out['report_delivery']={'kind':kind,'cutoff':cut.isoformat(),'title':title,'is_final':final,
+        'final_requested':bool(final_confirmed),'undated_confirmed':bool(undated_confirmed),
+        'missing_advisors':missing,'older_cutoffs':older,'undated_advisors':undated,'notes':notes}
+    out['reporting']={'kind':'weekly' if kind=='semanal' else 'monthly','cutoff':cut.isoformat(),
+        'label':('Seguimiento semanal acumulado' if kind=='semanal' else 'Cierre mensual final' if final else 'Cierre mensual provisional'),
+        'final':final,'note':' '.join(notes)}
+    # source/end_date y fechas de cada asesor se conservan, nunca se sustituyen por la fecha elegida.
+    return out
+
+
+def nx56_apply_reporting(context,kind,cutoff,confirmed=False,source_dates_confirmed=False):
+    normalized={'weekly':'semanal','monthly':'mensual','semanal':'semanal','mensual':'mensual'}.get(kind)
+    return nx56_apply_report_context(context,normalized,cutoff,confirmed,source_dates_confirmed)
+
+
+def nx56_snapshot_content(context):
+    import copy
+    value=copy.deepcopy(context)
+    for key in ['generated_at','snapshot_id','snapshot_created_at','snapshot_loaded','report_level']:
+        value.pop(key,None)
+    return value
+
+
+def nx56_save_snapshot(context,db_path=None):
+    import hashlib,json
+    delivery=context.get('report_delivery') or {}
+    if not delivery:raise ValueError('Define el tipo de entrega y la fecha de corte antes de guardar.')
+    # Validación repetida: no permite guardar metadatos alterados sin revisar las fechas.
+    checked=nx56_apply_report_context(context,delivery.get('kind'),delivery.get('cutoff'),
+        delivery.get('final_requested',False),delivery.get('undated_confirmed',False))
+    content=nx56_snapshot_content(checked)
+    raw=json.dumps(content,ensure_ascii=False,allow_nan=False,sort_keys=True,default=str,separators=(',',':'))
+    key=hashlib.sha256(raw.encode('utf-8')).hexdigest()
+    nx56_init(db_path)
+    with nx5_connection(db_path) as con:
+        result=con.execute('INSERT OR IGNORE INTO nx56_report_snapshots VALUES(?,?,?,?,?,?,?)',
+            (key,checked['period'],checked['report_cutoff'],checked['report_cadence'],int(checked['report_is_final']),raw,nx5_now()))
+        created=bool(result.rowcount)
+    return {'snapshot_id':key,'created':created,'period':checked['period'],'cutoff':checked['report_cutoff'],
+        'kind':checked['report_cadence'],'is_final':checked['report_is_final']}
+
+
+def nx56_list_snapshots(period=None,db_path=None):
+    import json
+    nx56_init(db_path)
+    query='SELECT snapshot_id,period,cutoff,kind,is_final,payload,created_at FROM nx56_report_snapshots'
+    params=()
+    if period is not None:query+=' WHERE period=?';params=(str(period),)
+    query+=' ORDER BY cutoff DESC,created_at DESC,snapshot_id DESC'
+    with nx5_connection(db_path) as con:rows=con.execute(query,params).fetchall()
+    out=[]
+    for key,month,cutoff,kind,final,raw,created in rows:
+        payload=json.loads(raw)
+        out.append({'snapshot_id':key,'period':month,'cutoff':cutoff,'kind':kind,'is_final':bool(final),
+            'created_at':created,'advisors_count':len(payload.get('advisors',[])),
+            'source_mode':payload.get('result_mode'),'label':('Semanal' if kind=='semanal' else 'Mensual')+' · '+cutoff+
+            ' · '+str(len(payload.get('advisors',[])))+' asesores · '+('Final' if final else 'Avance')})
+    return out
+
+
+def nx56_load_snapshot(snapshot_id,db_path=None):
+    import hashlib,json
+    nx56_init(db_path)
+    with nx5_connection(db_path) as con:
+        row=con.execute('SELECT payload,created_at FROM nx56_report_snapshots WHERE snapshot_id=?',(str(snapshot_id),)).fetchone()
+    if not row:raise ValueError('No se encontró esa entrega guardada.')
+    raw,created=row
+    if hashlib.sha256(raw.encode('utf-8')).hexdigest()!=snapshot_id:raise ValueError('La entrega guardada no supera la comprobación de integridad.')
+    out=json.loads(raw);out['snapshot_id']=str(snapshot_id);out['snapshot_created_at']=created;out['snapshot_loaded']=True
+    return out
+
+
+# La entrega semanal usa el acumulado del mes, con cortes que pueden conservarse.
+def nx56_delivery_ui(context):
+    import calendar
+    from datetime import date
+    period=context['period']
+    histories=nx56_list_snapshots(period)
+    lookup={r['snapshot_id']:r for r in histories}
+    choices=['actuales']+list(lookup)
+    key='nx56_delivery_source_'+period
+    if st.session_state.get(key) not in choices:st.session_state[key]='actuales'
+    selected=st.selectbox('Datos de la entrega',choices,
+        format_func=lambda k:'Datos actuales · preparar una entrega' if k=='actuales' else lookup[k]['label'],key=key,
+        help='Los cortes guardados conservan sus resultados, metas y equipo aunque luego cargues otro avance.')
+    if selected!='actuales':
+        saved=nx56_load_snapshot(selected)
+        st.info(saved['reporting']['label']+' · corte '+saved['reporting']['cutoff']+' · copia conservada de '+str(len(saved['advisors']))+' asesores.')
+        st.caption('Estás consultando los datos guardados de ese corte. Cambia a «Datos actuales» para preparar la próxima entrega.')
+        return saved,True
+    with st.container(key='nx56_delivery_settings'):
+        kind=st.radio('Tipo de entrega',['Seguimiento semanal','Cierre mensual'],horizontal=True,key='nx56_kind_'+period)
+        year,month=map(int,period.split('-'));first=date(year,month,1);last=date(year,month,calendar.monthrange(year,month)[1])
+        evidence=nx56_source_cutoffs(context)
+        dated=[nx56_date(r['date']) for r in evidence['dated']]
+        default=max(dated) if dated else None
+        cutoff=st.date_input('Fecha de corte de los datos',value=default,min_value=first,max_value=last,
+            format='DD/MM/YYYY',key='nx56_cutoff_'+period,
+            help='Elige la fecha real del avance recibido. Un archivo del fin de mes no permite reconstruir las semanas anteriores.')
+        confirmed=False
+        if kind=='Cierre mensual':
+            confirmed=st.checkbox('Confirmo que recibí todos los resultados definitivos de este mes',value=False,key='nx56_final_'+period)
+        undated_confirmed=False
+        if evidence['undated_advisors']:
+            undated_confirmed=st.checkbox('Confirmo que los datos de las planillas sin fecha corresponden al corte elegido',value=False,key='nx56_dates_confirm_'+period)
+            st.caption('Esta confirmación registra la fecha que tú conoces; conserva las fechas impresas y los datos que falten.')
+        st.caption('El semanal muestra el acumulado del mes y su avance frente a las metas mensuales. Cada corte se guarda por separado. Para ventas exclusivas de una semana necesitamos movimientos con fecha.')
+        if cutoff is None:
+            st.info('Selecciona la fecha real de corte para preparar el informe.')
+            return context,False
+        try:
+            current=nx56_apply_reporting(context,'weekly' if kind=='Seguimiento semanal' else 'monthly',cutoff,
+                confirmed=confirmed,source_dates_confirmed=undated_confirmed)
+        except ValueError as exc:
+            st.warning(str(exc));return context,False
+        st.caption(current['report_state'])
+        if confirmed and not current['reporting']['final']:
+            st.warning('El cierre seguirá provisional: faltan indicadores, metas o fechas de corte completas. Podrás descargarlo con esas observaciones.')
+        if st.button('Guardar este corte para seguimiento',key='nx56_save_cut'):
+            result=nx56_save_snapshot(current)
+            st.session_state.pop('nx53_script_download',None)
+            st.success('Corte guardado con sus resultados y metas.' if result['created'] else 'Este mismo corte ya estaba guardado.')
+            st.caption('Para conservarlo al reiniciar el alojamiento, usa Configuración → Respaldo → Preparar script con mis datos y actualiza tu repositorio.')
+        return current,True
+
+
+def nx56_delivery_file_piece(context):
+    info=context.get('reporting') or {}
+    if not info:return ''
+    return '_'+('semanal' if info['kind']=='weekly' else 'mensual')+'_'+nx52_file_piece(info['cutoff'],12)+('_final' if info.get('final') else '_avance')
+
+
+def nx56_ensure_saved(context):
+    if context.get('report_delivery') and not context.get('snapshot_loaded'):
+        result=nx56_save_snapshot(context)
+        st.session_state.pop('nx53_script_download',None)
+        return result
+    return None
+
+
 def main():
     st.set_page_config(page_title='NEXUS · Equipo comercial',page_icon='📊',layout='wide',initial_sidebar_state='expanded')
     initialization_key=APP_VERSION+'|'+str(DB_PATH)
@@ -11551,6 +13971,7 @@ def main():
         try:nx53_initialize()
         except Exception as exc:
             st.error('No se pudo abrir la información incluida: '+str(exc));st.stop()
+        nx54_init();nx55_init();nx55_results_init();nx56_init()
         st.session_state['_nx5_initialized']=initialization_key
     if st.session_state.get('nx5_period_to_select'):
         st.session_state['nx5_period']=st.session_state.pop('nx5_period_to_select')
@@ -11558,6 +13979,10 @@ def main():
     if st.session_state.get('nx5_period') not in periods:st.session_state['nx5_period']=nx53_initial_period()
     period=st.session_state['nx5_period'];context=nx5_context(period)
     nav,context,supervisor,motion=nx5_sidebar(context,periods)
+    reference_key=context['period']+'|'+str(context.get('master_roster_version'))
+    if st.session_state.get('_nx55_references')!=reference_key:
+        nx55_install_references(context);st.session_state['_nx55_references']=reference_key
+    context=nx55_result_selector(context)
     nx5_theme(motion)
     nx5_tour_ui()
     if st.session_state.get('nx5_flash'):st.success(st.session_state.pop('nx5_flash'))
@@ -11566,7 +13991,7 @@ def main():
     else:
         visible=nx5_filter_context(context,supervisor=supervisor)
         {'Inicio':nx5_home,'Equipo comercial':nx5_team,'Informes':nx5_reports}[nav](visible)
-    st.markdown('<div class="nx5-footer">MAKROPETROL NEXUS · EQUIPO COMERCIAL 5.3 · Datos con su fecha y su fuente</div>',unsafe_allow_html=True)
+    st.markdown('<div class="nx5-footer">MAKROPETROL NEXUS · EQUIPO COMERCIAL 5.6 · Datos con su fecha y su fuente</div>',unsafe_allow_html=True)
 
 
 if __name__=='__main__':
